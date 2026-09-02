@@ -1,0 +1,68 @@
+﻿name: CI
+
+on:
+  push:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  repository-structure:
+    name: Repository structure
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Validate root files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f README.md
+          test -f .gitignore
+          test -f .env.example
+
+      - name: Validate project directories
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -d apps
+          test -d services
+          test -d docs/adr
+          test -d .github/workflows
+
+      - name: Validate architecture decision records
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f docs/adr/ADR-001-rust-axum-backend.md
+          test -f docs/adr/ADR-002-modular-monolith.md
+          test -f docs/adr/ADR-003-postgresql-postgis.md
+          test -f docs/adr/ADR-004-docker.md
+          test -f docs/adr/ADR-005-supabase.md
+          test -f docs/adr/ADR-006-vercel-railway.md
+          test -f docs/adr/ADR-007-inventory-ledger.md
+          test -f docs/adr/ADR-008-transactional-outbox.md
+          test -f docs/adr/ADR-009-arca-read-only.md
+          test -f docs/adr/ADR-010-finnegans-adapter.md
+          test -f docs/adr/ADR-011-pwa-online-first.md
+          test -f docs/adr/ADR-012-github-ci.md
+
+      - name: Ensure local environment files are not tracked
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if git ls-files | grep -E '(^|/)\.env$|(^|/)\.env\.local$|(^|/)\.env\..*\.local$'; then
+            echo "A local environment file is tracked by Git."
+            exit 1
+          fi
+
+          echo "No local environment files are tracked."
