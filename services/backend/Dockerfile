@@ -11,6 +11,8 @@ RUN groupadd --gid "${LOCAL_GID}" agro \
         --shell /bin/bash \
         agro
 
+RUN rustup component add rustfmt
+
 RUN cargo install cargo-watch --version 8.5.3 --locked
 
 ENV CARGO_HOME=/home/agro/.cargo
