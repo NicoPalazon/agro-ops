@@ -24,6 +24,14 @@ services:
       - agro-ops
 
   api:
+    build:
+      context: ./services/backend
+      dockerfile: Dockerfile
+      target: dev
+      args:
+        LOCAL_UID: ${LOCAL_UID:-1000}
+        LOCAL_GID: ${LOCAL_GID:-1000}
+
     image: agro-ops-backend-dev:latest
     container_name: agro-ops-api-dev
     init: true
@@ -46,7 +54,6 @@ services:
 
     volumes:
       - ./services/backend:/app
-      - backend-target:/app/target
 
     depends_on:
       postgres:
@@ -56,6 +63,14 @@ services:
       - agro-ops
 
   worker:
+    build:
+      context: ./services/backend
+      dockerfile: Dockerfile
+      target: dev
+      args:
+        LOCAL_UID: ${LOCAL_UID:-1000}
+        LOCAL_GID: ${LOCAL_GID:-1000}
+
     image: agro-ops-backend-dev:latest
     container_name: agro-ops-worker-dev
     init: true
@@ -74,7 +89,6 @@ services:
 
     volumes:
       - ./services/backend:/app
-      - backend-target:/app/target
 
     depends_on:
       postgres:
@@ -86,9 +100,6 @@ services:
 volumes:
   postgres-data:
     name: agro-ops-postgres-data
-
-  backend-target:
-    name: agro-ops-backend-target
 
 networks:
   agro-ops:

@@ -1,8 +1,26 @@
 FROM rust:1.98.0-bookworm AS dev
 
-WORKDIR /app
+ARG LOCAL_UID=1000
+ARG LOCAL_GID=1000
+
+RUN groupadd --gid "${LOCAL_GID}" agro \
+    && useradd \
+        --uid "${LOCAL_UID}" \
+        --gid "${LOCAL_GID}" \
+        --create-home \
+        --shell /bin/bash \
+        agro
 
 RUN cargo install cargo-watch --version 8.5.3 --locked
+
+ENV CARGO_HOME=/home/agro/.cargo
+
+RUN mkdir -p /home/agro/.cargo \
+    && chown -R agro:agro /home/agro
+
+WORKDIR /app
+
+USER agro
 
 CMD ["cargo", "watch", "-x", "run --bin api"]
 
