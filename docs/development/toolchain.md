@@ -25,7 +25,31 @@ Baseline técnico aprobado para el desarrollo de Agro Ops.
 | --- | --- |
 | Docker Engine | 29.7.2 |
 | Docker Compose | 5.5.0 |
+| SQLx CLI | 0.9.0 (PostgreSQL) |
 | actions/checkout | v7 |
+
+## Migrations del backend
+
+SQLx CLI está disponible en la imagen `dev` del backend. Los comandos se ejecutan
+desde `/app`, donde Compose monta `services/backend`.
+
+Crear una migration:
+
+    docker compose run --rm api sqlx migrate add <nombre> --source migrations
+
+Ejecutar migrations y consultar su estado:
+
+    docker compose run --rm api sqlx migrate run --source migrations
+    docker compose run --rm api sqlx migrate info --source migrations
+
+Para probar todas las migrations desde una base vacía sin modificar `agro_ops`:
+
+    docker compose exec postgres dropdb --if-exists -U agro_ops agro_ops_migration_test
+    docker compose exec postgres createdb -U agro_ops agro_ops_migration_test
+    docker compose run --rm -e DATABASE_URL=postgres://agro_ops:agro_ops@postgres:5432/agro_ops_migration_test api sqlx migrate run --source migrations
+    docker compose exec postgres psql -U agro_ops -d agro_ops_migration_test -c 'TABLE _sqlx_migrations;'
+    docker compose exec postgres psql -U agro_ops -d agro_ops_migration_test -c 'SELECT PostGIS_Version();'
+    docker compose exec postgres dropdb -U agro_ops agro_ops_migration_test
 
 ## Política de versiones
 

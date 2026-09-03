@@ -1,9 +1,4 @@
-use axum::{
-    Json, Router,
-    extract::State,
-    http::StatusCode,
-    routing::get,
-};
+use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
 use serde::Serialize;
 use sqlx::PgPool;
 
@@ -35,17 +30,12 @@ async fn health() -> Json<StatusResponse> {
     Json(StatusResponse { status: "ok" })
 }
 
-async fn ready(
-    State(state): State<AppState>,
-) -> (StatusCode, Json<StatusResponse>) {
+async fn ready(State(state): State<AppState>) -> (StatusCode, Json<StatusResponse>) {
     match sqlx::query_scalar::<_, i32>("SELECT 1")
         .fetch_one(&state.db)
         .await
     {
-        Ok(_) => (
-            StatusCode::OK,
-            Json(StatusResponse { status: "ready" }),
-        ),
+        Ok(_) => (StatusCode::OK, Json(StatusResponse { status: "ready" })),
         Err(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(StatusResponse {
