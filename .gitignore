@@ -29,3 +29,6 @@ Thumbs.db
 *.sqlite3
 tmp/
 temp/
+
+# pnpm local stores
+**/.pnpm-store/
