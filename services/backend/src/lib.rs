@@ -2,6 +2,8 @@ use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
 use serde::Serialize;
 use sqlx::PgPool;
 
+pub mod worker;
+
 #[derive(Clone)]
 pub struct AppState {
     pub db: PgPool,

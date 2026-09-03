@@ -97,9 +97,40 @@ services:
     networks:
       - agro-ops
 
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+
+    image: agro-ops-web-dev:latest
+    container_name: agro-ops-web-dev
+    init: true
+
+    working_dir: /app
+
+    command:
+      - sh
+      - -c
+      - pnpm install --frozen-lockfile --store-dir /pnpm/store && pnpm dev --hostname 0.0.0.0
+
+    ports:
+      - "3000:3000"
+
+    volumes:
+      - ./apps/web:/app
+      - web-node-modules:/app/node_modules
+      - web-pnpm-store:/pnpm/store
+
+    networks:
+      - agro-ops
+
 volumes:
   postgres-data:
     name: agro-ops-postgres-data
+  web-node-modules:
+    name: agro-ops-web-node-modules
+  web-pnpm-store:
+    name: agro-ops-web-pnpm-store
 
 networks:
   agro-ops:
