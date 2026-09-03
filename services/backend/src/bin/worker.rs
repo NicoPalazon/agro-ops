@@ -1,30 +1,39 @@
-use std::time::Duration;
-
 use agro_ops_backend::{
+    config::RuntimeConfig,
     telemetry::init_tracing,
     worker::{Worker, walking_skeleton_test_job},
 };
 use sqlx::postgres::PgPoolOptions;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{error, info};
 
 #[tokio::main]
 async fn main() {
     init_tracing();
 
+    let config = RuntimeConfig::from_env().unwrap_or_else(|error| {
+        error!(service = "worker", %error, "startup configuration invalid");
+        std::process::exit(1);
+    });
+
     info!(
         service = "worker",
         version = env!("CARGO_PKG_VERSION"),
+        environment = %config.app_environment(),
         "Agro Ops worker started"
     );
 
-    let heartbeat_interval = heartbeat_interval();
-    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let db = PgPoolOptions::new()
         .max_connections(2)
-        .connect_lazy(&database_url)
-        .expect("DATABASE_URL must be valid");
-    let worker = Worker::new(heartbeat_interval, db);
+        .connect_lazy(config.database_url())
+        .unwrap_or_else(|_| {
+            error!(
+                service = "worker",
+                "invalid configuration: DATABASE_URL must be a valid PostgreSQL connection URL"
+            );
+            std::process::exit(1);
+        });
+    let worker = Worker::new(config.worker_heartbeat_interval(), db);
     let (job_sender, job_receiver) = mpsc::channel(1);
 
     if std::env::args().any(|argument| argument == "--test-job-once") {
@@ -55,18 +64,4 @@ async fn main() {
     }
 
     info!(service = "worker", "Agro Ops worker stopped");
-}
-
-fn heartbeat_interval() -> Duration {
-    let seconds = std::env::var("WORKER_HEARTBEAT_INTERVAL_SECONDS")
-        .unwrap_or_else(|_| "5".to_string())
-        .parse::<u64>()
-        .expect("WORKER_HEARTBEAT_INTERVAL_SECONDS must be a positive integer");
-
-    assert!(
-        seconds > 0,
-        "WORKER_HEARTBEAT_INTERVAL_SECONDS must be greater than zero"
-    );
-
-    Duration::from_secs(seconds)
 }

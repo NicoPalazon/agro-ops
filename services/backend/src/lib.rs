@@ -14,6 +14,7 @@ use tracing::{Instrument, info, info_span, warn};
 use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
+pub mod config;
 pub mod service_heartbeats;
 pub mod telemetry;
 pub mod worker;

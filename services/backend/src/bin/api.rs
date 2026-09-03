@@ -1,32 +1,43 @@
-use agro_ops_backend::{AppState, app, telemetry::init_tracing};
+use std::net::SocketAddr;
+
+use agro_ops_backend::{AppState, app, config::RuntimeConfig, telemetry::init_tracing};
 use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{error, info};
 
 #[tokio::main]
 async fn main() {
     init_tracing();
 
-    let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
-
-    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let config = RuntimeConfig::from_env().unwrap_or_else(|error| {
+        error!(service = "api", %error, "startup configuration invalid");
+        std::process::exit(1);
+    });
 
     let db = PgPoolOptions::new()
         .max_connections(5)
-        .connect_lazy(&database_url)
-        .expect("DATABASE_URL must be valid");
+        .connect_lazy(config.database_url())
+        .unwrap_or_else(|_| {
+            error!(
+                service = "api",
+                "invalid configuration: DATABASE_URL must be a valid PostgreSQL connection URL"
+            );
+            std::process::exit(1);
+        });
 
     let state = AppState { db };
 
-    let address = format!("0.0.0.0:{port}");
+    let address = SocketAddr::from(([0, 0, 0, 0], config.port()));
 
-    let listener = TcpListener::bind(&address)
-        .await
-        .expect("failed to bind API listener");
+    let listener = TcpListener::bind(address).await.unwrap_or_else(|error| {
+        error!(service = "api", %error, "failed to bind API listener");
+        std::process::exit(1);
+    });
 
     info!(
         service = "api",
         version = env!("CARGO_PKG_VERSION"),
+        environment = %config.app_environment(),
         %address,
         "Agro Ops API started"
     );
