@@ -1,16 +1,11 @@
-use agro_ops_backend::{AppState, app};
+use agro_ops_backend::{AppState, app, telemetry::init_tracing};
 use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
 use tracing::info;
-use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    init_tracing();
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
 
@@ -29,7 +24,12 @@ async fn main() {
         .await
         .expect("failed to bind API listener");
 
-    info!(%address, "Agro Ops API started");
+    info!(
+        service = "api",
+        version = env!("CARGO_PKG_VERSION"),
+        %address,
+        "Agro Ops API started"
+    );
 
     axum::serve(listener, app(state))
         .with_graceful_shutdown(shutdown_signal())
@@ -42,5 +42,5 @@ async fn shutdown_signal() {
         .await
         .expect("failed to listen for shutdown signal");
 
-    info!("shutdown signal received");
+    info!(service = "api", "shutdown signal received");
 }

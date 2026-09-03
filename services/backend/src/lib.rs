@@ -1,9 +1,20 @@
-use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
+use std::time::Instant;
+
+use axum::{
+    Json, Router,
+    extract::{MatchedPath, Request, State},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
+    middleware::{self, Next},
+    response::Response,
+    routing::get,
+};
 use serde::Serialize;
 use sqlx::PgPool;
-use tracing::warn;
+use tracing::{Instrument, info, info_span, warn};
+use uuid::Uuid;
 
 pub mod service_heartbeats;
+pub mod telemetry;
 pub mod worker;
 
 use service_heartbeats::{ServiceStatusReport, WORKER_SERVICE_NAME};
@@ -12,6 +23,10 @@ use service_heartbeats::{ServiceStatusReport, WORKER_SERVICE_NAME};
 pub struct AppState {
     pub db: PgPool,
 }
+
+const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
+const CORRELATION_ID_HEADER: HeaderName = HeaderName::from_static("x-correlation-id");
+const MAX_CORRELATION_ID_LENGTH: usize = 128;
 
 #[derive(Serialize)]
 struct StatusResponse {
@@ -30,7 +45,60 @@ pub fn app(state: AppState) -> Router {
         .route("/ready", get(ready))
         .route("/version", get(version))
         .route("/internal/worker/status", get(internal_worker_status))
+        .layer(middleware::from_fn(request_tracing))
         .with_state(state)
+}
+
+async fn request_tracing(request: Request, next: Next) -> Response {
+    let request_id = Uuid::new_v4().to_string();
+    let correlation_id =
+        correlation_id(request.headers()).unwrap_or_else(|| Uuid::new_v4().to_string());
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let route = request.extensions().get::<MatchedPath>().map_or_else(
+        || path.clone(),
+        |matched_path| matched_path.as_str().to_owned(),
+    );
+    let started_at = Instant::now();
+    let span = info_span!(
+        "http_request",
+        service = "api",
+        request_id = %request_id,
+        correlation_id = %correlation_id,
+        method = %method,
+        path = %path,
+        route = %route,
+        status = tracing::field::Empty,
+        latency_ms = tracing::field::Empty,
+    );
+
+    info!(parent: &span, "request started");
+    let mut response = next.run(request).instrument(span.clone()).await;
+    let latency_ms = started_at.elapsed().as_millis() as u64;
+    span.record("status", response.status().as_u16());
+    span.record("latency_ms", latency_ms);
+    response.headers_mut().insert(
+        REQUEST_ID_HEADER,
+        HeaderValue::from_str(&request_id).expect("UUID request ID must be a valid header value"),
+    );
+    response.headers_mut().insert(
+        CORRELATION_ID_HEADER,
+        HeaderValue::from_str(&correlation_id)
+            .expect("validated correlation ID must be a valid header value"),
+    );
+    info!(parent: &span, "request completed");
+
+    response
+}
+
+fn correlation_id(headers: &HeaderMap) -> Option<String> {
+    let correlation_id = headers.get(&CORRELATION_ID_HEADER)?.to_str().ok()?;
+
+    (1..=MAX_CORRELATION_ID_LENGTH)
+        .contains(&correlation_id.len())
+        .then_some(correlation_id)
+        .filter(|value| value.bytes().all(|byte| byte.is_ascii_graphic()))
+        .map(str::to_owned)
 }
 
 async fn health() -> Json<StatusResponse> {
@@ -127,6 +195,107 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response_body(response).await, r#"{"status":"ok"}"#);
+    }
+
+    #[tokio::test]
+    async fn health_response_contains_generated_request_and_correlation_ids() {
+        let response = app(unavailable_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .expect("health request must be valid"),
+            )
+            .await
+            .expect("health request must succeed");
+
+        assert!(response.headers().contains_key("x-request-id"));
+        assert!(response.headers().contains_key("x-correlation-id"));
+        let request_id = response.headers()["x-request-id"]
+            .to_str()
+            .expect("generated request ID must be valid ASCII");
+        let correlation_id = response.headers()["x-correlation-id"]
+            .to_str()
+            .expect("generated correlation ID must be valid ASCII");
+        assert!(Uuid::parse_str(request_id).is_ok());
+        assert!(Uuid::parse_str(correlation_id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn supplied_correlation_id_is_propagated_unchanged() {
+        let response = app(unavailable_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("x-correlation-id", "test-correlation-123")
+                    .body(Body::empty())
+                    .expect("health request must be valid"),
+            )
+            .await
+            .expect("health request must succeed");
+
+        assert_eq!(
+            response.headers()["x-correlation-id"],
+            HeaderValue::from_static("test-correlation-123")
+        );
+        assert_ne!(
+            response.headers()["x-request-id"],
+            response.headers()["x-correlation-id"]
+        );
+    }
+
+    #[tokio::test]
+    async fn each_request_receives_a_distinct_request_id() {
+        let first = app(unavailable_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .expect("first health request must be valid"),
+            )
+            .await
+            .expect("first health request must succeed");
+        let second = app(unavailable_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .expect("second health request must be valid"),
+            )
+            .await
+            .expect("second health request must succeed");
+
+        assert_ne!(
+            first.headers()["x-request-id"],
+            second.headers()["x-request-id"]
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_or_oversized_correlation_id_is_replaced_with_a_generated_id() {
+        for invalid_correlation_id in [
+            "not a valid correlation ID".to_owned(),
+            "a".repeat(MAX_CORRELATION_ID_LENGTH + 1),
+        ] {
+            let response = app(unavailable_state())
+                .oneshot(
+                    Request::builder()
+                        .uri("/health")
+                        .header(
+                            HeaderName::from_static("x-correlation-id"),
+                            invalid_correlation_id,
+                        )
+                        .body(Body::empty())
+                        .expect("health request must be valid"),
+                )
+                .await
+                .expect("health request must succeed");
+
+            let correlation_id = response.headers()["x-correlation-id"]
+                .to_str()
+                .expect("generated correlation ID must be valid ASCII");
+            assert!(Uuid::parse_str(correlation_id).is_ok());
+        }
     }
 
     #[tokio::test]

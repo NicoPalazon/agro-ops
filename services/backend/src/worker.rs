@@ -65,7 +65,7 @@ impl Worker {
                     }
                 }
                 _ = &mut shutdown => {
-                    info!("worker shutdown requested");
+                    info!(service = "worker", "worker shutdown requested");
                     self.notify(WorkerEvent::Stopped);
                     break;
                 }
@@ -77,22 +77,27 @@ impl Worker {
         if let Some(db) = &self.heartbeat_db
             && let Err(error) = record_service_heartbeat(db, WORKER_SERVICE_NAME).await
         {
-            warn!(%error, "failed to persist worker heartbeat");
+            warn!(service = "worker", %error, "failed to persist worker heartbeat");
         }
 
-        info!("worker heartbeat");
+        info!(service = "worker", "worker heartbeat");
         self.notify(WorkerEvent::Heartbeat);
     }
 
     async fn process(&self, job: WorkerJob) {
         match job {
             WorkerJob::WalkingSkeletonTest { completed } => {
-                info!(job_id = WALKING_SKELETON_TEST_JOB_ID, "worker job received");
+                info!(
+                    service = "worker",
+                    job_id = WALKING_SKELETON_TEST_JOB_ID,
+                    "worker job received"
+                );
                 self.notify(WorkerEvent::JobReceived(WALKING_SKELETON_TEST_JOB_ID));
 
                 tokio::task::yield_now().await;
 
                 info!(
+                    service = "worker",
                     job_id = WALKING_SKELETON_TEST_JOB_ID,
                     "worker job completed"
                 );

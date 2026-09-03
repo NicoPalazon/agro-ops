@@ -1,20 +1,22 @@
 use std::time::Duration;
 
-use agro_ops_backend::worker::{Worker, walking_skeleton_test_job};
+use agro_ops_backend::{
+    telemetry::init_tracing,
+    worker::{Worker, walking_skeleton_test_job},
+};
 use sqlx::postgres::PgPoolOptions;
 use tokio::sync::mpsc;
 use tracing::info;
-use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    init_tracing();
 
-    info!("Agro Ops worker started");
+    info!(
+        service = "worker",
+        version = env!("CARGO_PKG_VERSION"),
+        "Agro Ops worker started"
+    );
 
     let heartbeat_interval = heartbeat_interval();
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
@@ -52,7 +54,7 @@ async fn main() {
             .await;
     }
 
-    info!("Agro Ops worker stopped");
+    info!(service = "worker", "Agro Ops worker stopped");
 }
 
 fn heartbeat_interval() -> Duration {
