@@ -70,6 +70,24 @@ jobs:
     name: Backend Rust
     runs-on: ubuntu-latest
 
+    services:
+      postgres:
+        image: postgis/postgis:17-3.5
+        env:
+          POSTGRES_USER: agro_ops
+          POSTGRES_PASSWORD: agro_ops
+          POSTGRES_DB: agro_ops
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agro_ops -d agro_ops"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgres://agro_ops:agro_ops@localhost:5432/agro_ops
+
     defaults:
       run:
         working-directory: services/backend
@@ -83,6 +101,14 @@ jobs:
         with:
           toolchain: 1.98.0
           components: rustfmt, clippy
+
+      - name: Install SQLx CLI
+        run: >-
+          cargo install sqlx-cli --version 0.9.0 --no-default-features
+          --features rustls,postgres --locked
+
+      - name: Apply database migrations
+        run: sqlx migrate run --source migrations
 
       - name: Check formatting
         run: cargo fmt --all -- --check
