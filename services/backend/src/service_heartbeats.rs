@@ -1,9 +1,10 @@
 use serde::Serialize;
 use sqlx::PgPool;
+use utoipa::ToSchema;
 
 pub const WORKER_SERVICE_NAME: &str = "worker";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceStatus {
     Healthy,
@@ -11,7 +12,7 @@ pub enum ServiceStatus {
     Unavailable,
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct ServiceStatusReport {
     pub service: String,
     pub status: ServiceStatus,
