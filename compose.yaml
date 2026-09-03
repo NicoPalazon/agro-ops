@@ -1,0 +1,95 @@
+services:
+  postgres:
+    image: postgis/postgis:17-3.5
+    container_name: agro-ops-postgres-dev
+
+    environment:
+      POSTGRES_USER: agro_ops
+      POSTGRES_PASSWORD: agro_ops
+      POSTGRES_DB: agro_ops
+
+    ports:
+      - "5432:5432"
+
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agro_ops -d agro_ops"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+    networks:
+      - agro-ops
+
+  api:
+    image: agro-ops-backend-dev:latest
+    container_name: agro-ops-api-dev
+    init: true
+
+    working_dir: /app
+
+    command:
+      - cargo
+      - watch
+      - -x
+      - run --bin api
+
+    environment:
+      PORT: 8080
+      DATABASE_URL: postgres://agro_ops:agro_ops@postgres:5432/agro_ops
+      RUST_LOG: info
+
+    ports:
+      - "8080:8080"
+
+    volumes:
+      - ./services/backend:/app
+      - backend-target:/app/target
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    networks:
+      - agro-ops
+
+  worker:
+    image: agro-ops-backend-dev:latest
+    container_name: agro-ops-worker-dev
+    init: true
+
+    working_dir: /app
+
+    command:
+      - cargo
+      - watch
+      - -x
+      - run --bin worker
+
+    environment:
+      DATABASE_URL: postgres://agro_ops:agro_ops@postgres:5432/agro_ops
+      RUST_LOG: info
+
+    volumes:
+      - ./services/backend:/app
+      - backend-target:/app/target
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    networks:
+      - agro-ops
+
+volumes:
+  postgres-data:
+    name: agro-ops-postgres-data
+
+  backend-target:
+    name: agro-ops-backend-target
+
+networks:
+  agro-ops:
+    name: agro-ops
