@@ -151,6 +151,9 @@ jobs:
       - name: Run lint
         run: pnpm lint
 
+      - name: Generate Next.js route types
+        run: pnpm exec next typegen
+
       - name: Run TypeScript typecheck
         run: pnpm exec tsc --noEmit
 
