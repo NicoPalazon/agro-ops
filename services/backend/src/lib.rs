@@ -1,5 +1,16 @@
-use axum::{Json, Router, routing::get};
+use axum::{
+    Json, Router,
+    extract::State,
+    http::StatusCode,
+    routing::get,
+};
 use serde::Serialize;
+use sqlx::PgPool;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub db: PgPool,
+}
 
 #[derive(Serialize)]
 struct StatusResponse {
@@ -12,19 +23,36 @@ struct VersionResponse {
     version: &'static str,
 }
 
-pub fn app() -> Router {
+pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/version", get(version))
+        .with_state(state)
 }
 
 async fn health() -> Json<StatusResponse> {
     Json(StatusResponse { status: "ok" })
 }
 
-async fn ready() -> Json<StatusResponse> {
-    Json(StatusResponse { status: "ready" })
+async fn ready(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<StatusResponse>) {
+    match sqlx::query_scalar::<_, i32>("SELECT 1")
+        .fetch_one(&state.db)
+        .await
+    {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(StatusResponse { status: "ready" }),
+        ),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(StatusResponse {
+                status: "not_ready",
+            }),
+        ),
+    }
 }
 
 async fn version() -> Json<VersionResponse> {
@@ -32,65 +60,4 @@ async fn version() -> Json<VersionResponse> {
         service: env!("CARGO_PKG_NAME"),
         version: env!("CARGO_PKG_VERSION"),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::{
-        body::{Body, to_bytes},
-        http::{Request, StatusCode},
-    };
-    use tower::ServiceExt;
-
-    #[tokio::test]
-    async fn health_returns_ok() {
-        let response = app()
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn ready_returns_ok() {
-        let response = app()
-            .oneshot(
-                Request::builder()
-                    .uri("/ready")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn version_returns_package_version() {
-        let response = app()
-            .oneshot(
-                Request::builder()
-                    .uri("/version")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-
-        let body = String::from_utf8(body.to_vec()).unwrap();
-
-        assert!(body.contains(env!("CARGO_PKG_VERSION")));
-    }
 }

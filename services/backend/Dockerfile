@@ -1,3 +1,12 @@
+FROM rust:1.98.0-bookworm AS dev
+
+WORKDIR /app
+
+RUN cargo install cargo-watch --version 8.5.3 --locked
+
+CMD ["cargo", "watch", "-x", "run --bin api"]
+
+
 FROM rust:1.98.0-bookworm AS builder
 
 WORKDIR /app
