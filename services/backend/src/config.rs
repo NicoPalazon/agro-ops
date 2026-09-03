@@ -228,6 +228,38 @@ mod tests {
     }
 
     #[test]
+    fn rejects_zero_worker_heartbeat_interval_without_exposing_database_url() {
+        let error = config(&[
+            ("DATABASE_URL", DATABASE_URL),
+            ("WORKER_HEARTBEAT_INTERVAL_SECONDS", "0"),
+        ])
+        .expect_err("zero worker heartbeat interval must fail");
+
+        assert_eq!(error, ConfigError::InvalidWorkerHeartbeatInterval);
+        assert_eq!(
+            error.to_string(),
+            "invalid configuration: WORKER_HEARTBEAT_INTERVAL_SECONDS must be a positive integer"
+        );
+        assert!(!format!("{error:?}").contains(DATABASE_URL));
+    }
+
+    #[test]
+    fn rejects_non_integer_worker_heartbeat_interval_without_exposing_database_url() {
+        let error = config(&[
+            ("DATABASE_URL", DATABASE_URL),
+            ("WORKER_HEARTBEAT_INTERVAL_SECONDS", "abc"),
+        ])
+        .expect_err("non-integer worker heartbeat interval must fail");
+
+        assert_eq!(error, ConfigError::InvalidWorkerHeartbeatInterval);
+        assert_eq!(
+            error.to_string(),
+            "invalid configuration: WORKER_HEARTBEAT_INTERVAL_SECONDS must be a positive integer"
+        );
+        assert!(!format!("{error:?}").contains(DATABASE_URL));
+    }
+
+    #[test]
     fn rejects_missing_database_url() {
         let error = config(&[("APP_ENV", "local")]).expect_err("missing database URL must fail");
 
