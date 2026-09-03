@@ -108,6 +108,9 @@ services:
 
     working_dir: /app
 
+    environment:
+      API_BASE_URL: http://api:8080
+
     command:
       - sh
       - -c

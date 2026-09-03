@@ -11,14 +11,15 @@ RUN groupadd --gid "${LOCAL_GID}" agro \
         --shell /bin/bash \
         agro
 
-RUN rustup component add rustfmt
+RUN rustup component add rustfmt clippy
 
 RUN cargo install cargo-watch --version 8.5.3 --locked
 
 RUN cargo install sqlx-cli \
     --version 0.9.0 \
     --no-default-features \
-    --features rustls,postgres
+    --features rustls,postgres \
+    --locked
 
 ENV CARGO_HOME=/home/agro/.cargo
 

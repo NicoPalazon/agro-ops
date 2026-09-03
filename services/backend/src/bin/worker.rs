@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use agro_ops_backend::worker::{Worker, walking_skeleton_test_job};
+use sqlx::postgres::PgPoolOptions;
 use tokio::sync::mpsc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -16,7 +17,12 @@ async fn main() {
     info!("Agro Ops worker started");
 
     let heartbeat_interval = heartbeat_interval();
-    let worker = Worker::new(heartbeat_interval);
+    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let db = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_lazy(&database_url)
+        .expect("DATABASE_URL must be valid");
+    let worker = Worker::new(heartbeat_interval, db);
     let (job_sender, job_receiver) = mpsc::channel(1);
 
     if std::env::args().any(|argument| argument == "--test-job-once") {

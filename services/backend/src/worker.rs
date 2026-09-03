@@ -1,10 +1,13 @@
 use std::{future::Future, time::Duration};
 
+use sqlx::PgPool;
 use tokio::{
     sync::{mpsc, oneshot},
     time::{self, MissedTickBehavior},
 };
-use tracing::info;
+use tracing::{info, warn};
+
+use crate::service_heartbeats::{WORKER_SERVICE_NAME, record_service_heartbeat};
 
 const WALKING_SKELETON_TEST_JOB_ID: &str = "walking-skeleton-test-job";
 
@@ -26,13 +29,15 @@ pub fn walking_skeleton_test_job() -> (WorkerJob, oneshot::Receiver<()>) {
 
 pub struct Worker {
     heartbeat_interval: Duration,
+    heartbeat_db: Option<PgPool>,
     event_sender: Option<mpsc::UnboundedSender<WorkerEvent>>,
 }
 
 impl Worker {
-    pub fn new(heartbeat_interval: Duration) -> Self {
+    pub fn new(heartbeat_interval: Duration, heartbeat_db: PgPool) -> Self {
         Self {
             heartbeat_interval,
+            heartbeat_db: Some(heartbeat_db),
             event_sender: None,
         }
     }
@@ -51,8 +56,7 @@ impl Worker {
         loop {
             tokio::select! {
                 _ = heartbeat.tick() => {
-                    info!("worker heartbeat");
-                    self.notify(WorkerEvent::Heartbeat);
+                    self.heartbeat().await;
                 }
                 job = jobs.recv(), if jobs_open => {
                     match job {
@@ -67,6 +71,17 @@ impl Worker {
                 }
             }
         }
+    }
+
+    async fn heartbeat(&self) {
+        if let Some(db) = &self.heartbeat_db
+            && let Err(error) = record_service_heartbeat(db, WORKER_SERVICE_NAME).await
+        {
+            warn!(%error, "failed to persist worker heartbeat");
+        }
+
+        info!("worker heartbeat");
+        self.notify(WorkerEvent::Heartbeat);
     }
 
     async fn process(&self, job: WorkerJob) {
@@ -100,6 +115,7 @@ impl Worker {
     ) -> Self {
         Self {
             heartbeat_interval,
+            heartbeat_db: None,
             event_sender: Some(event_sender),
         }
     }
