@@ -292,6 +292,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn version_returns_package_metadata_and_request_identity_headers() {
+        let response = app(unavailable_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/version")
+                    .header("x-correlation-id", "version-test-correlation")
+                    .body(Body::empty())
+                    .expect("version request must be valid"),
+            )
+            .await
+            .expect("version request must succeed");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "application/json");
+        assert!(
+            Uuid::parse_str(
+                response.headers()["x-request-id"]
+                    .to_str()
+                    .expect("request ID must be valid ASCII")
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            response.headers()["x-correlation-id"],
+            HeaderValue::from_static("version-test-correlation")
+        );
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(response).await)
+            .expect("version response must be valid JSON");
+        assert_eq!(body["service"], env!("CARGO_PKG_NAME"));
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
     async fn openapi_document_exposes_current_api_contract_and_request_identity_headers() {
         let response = app(unavailable_state())
             .oneshot(
