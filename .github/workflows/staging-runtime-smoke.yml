@@ -1,0 +1,22 @@
+name: Staging runtime smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  staging-runtime-smoke:
+    name: Smoke staging API and worker
+    runs-on: ubuntu-latest
+    environment: staging
+    env:
+      STAGING_API_BASE_URL: ${{ vars.STAGING_API_BASE_URL }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Run staging runtime smoke
+        run: bash scripts/staging-runtime-smoke.sh

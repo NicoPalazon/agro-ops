@@ -1,6 +1,8 @@
 use std::net::SocketAddr;
 
-use agro_ops_backend::{AppState, app, config::RuntimeConfig, telemetry::init_tracing};
+use agro_ops_backend::{
+    AppState, app, config::RuntimeConfig, shutdown::shutdown_signal, telemetry::init_tracing,
+};
 use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
 use tracing::{error, info};
@@ -43,15 +45,16 @@ async fn main() {
     );
 
     axum::serve(listener, app(state))
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async {
+            let signal = shutdown_signal().await;
+            info!(
+                service = "api",
+                signal = signal.as_str(),
+                "shutdown signal received"
+            );
+        })
         .await
         .expect("API server failed");
-}
 
-async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to listen for shutdown signal");
-
-    info!(service = "api", "shutdown signal received");
+    info!(service = "api", "Agro Ops API stopped");
 }

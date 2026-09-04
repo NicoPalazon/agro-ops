@@ -1,5 +1,6 @@
 use agro_ops_backend::{
     config::RuntimeConfig,
+    shutdown::shutdown_signal,
     telemetry::init_tracing,
     worker::{Worker, walking_skeleton_test_job},
 };
@@ -56,9 +57,12 @@ async fn main() {
 
         worker
             .run(job_receiver, async {
-                tokio::signal::ctrl_c()
-                    .await
-                    .expect("failed to listen for shutdown signal");
+                let signal = shutdown_signal().await;
+                info!(
+                    service = "worker",
+                    signal = signal.as_str(),
+                    "shutdown signal received"
+                );
             })
             .await;
     }

@@ -39,10 +39,9 @@ services:
     working_dir: /app
 
     command:
-      - cargo
-      - watch
-      - -x
-      - run --bin api
+      - bash
+      - scripts/dev-watch.sh
+      - api
 
     environment:
       APP_ENV: local
@@ -79,10 +78,9 @@ services:
     working_dir: /app
 
     command:
-      - cargo
-      - watch
-      - -x
-      - run --bin worker
+      - bash
+      - scripts/dev-watch.sh
+      - worker
 
     environment:
       APP_ENV: local

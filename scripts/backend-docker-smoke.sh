@@ -92,6 +92,34 @@ wait_for_healthy_worker() {
     fail "worker status did not become healthy within 30 seconds"
 }
 
+wait_for_stale_worker() {
+    local response_file="${temporary_dir}/worker-status-after-stop.json"
+    local attempt status
+
+    for attempt in {1..30}; do
+        status="$(curl --silent --show-error --output "${response_file}" --write-out '%{http_code}' \
+            "http://127.0.0.1:${api_port}/internal/worker/status" 2>/dev/null || true)"
+        if [[ "${status}" == "200" ]] \
+            && grep --fixed-strings --quiet '"status":"stale"' "${response_file}"; then
+            return
+        fi
+        sleep 1
+    done
+
+    fail "stopped worker did not become stale within 30 seconds"
+}
+
+assert_container_exited_zero() {
+    local container="$1"
+    local service="$2"
+    local exit_code
+
+    exit_code="$(docker inspect --format '{{.State.ExitCode}}' "${container}")"
+    if [[ "${exit_code}" != "0" ]]; then
+        fail "${service} exited with code ${exit_code} after Docker SIGTERM"
+    fi
+}
+
 assert_log_has_no_secret() {
     local log_file="$1"
 
@@ -151,6 +179,13 @@ wait_for_http_200 /health
 wait_for_http_200 /ready
 wait_for_http_200 /version
 wait_for_healthy_worker
+
+docker stop --time 10 "${worker_container}" >/dev/null
+assert_container_exited_zero "${worker_container}" worker
+wait_for_stale_worker
+
+docker stop --time 10 "${api_container}" >/dev/null
+assert_container_exited_zero "${api_container}" API
 
 docker logs "${api_container}" >"${temporary_dir}/api.log" 2>&1
 docker logs "${worker_container}" >"${temporary_dir}/worker.log" 2>&1

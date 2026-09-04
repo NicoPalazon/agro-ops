@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 pub mod config;
 pub mod service_heartbeats;
+pub mod shutdown;
 pub mod telemetry;
 pub mod worker;
 

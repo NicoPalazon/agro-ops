@@ -66,6 +66,9 @@ jobs:
           fi
 
           echo "No local environment files are tracked."
+
+      - name: Test staging runtime smoke helpers
+        run: bash scripts/staging-runtime-smoke-test.sh
   backend-rust:
     name: Backend Rust
     runs-on: ubuntu-latest
