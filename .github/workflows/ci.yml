@@ -105,6 +105,20 @@ jobs:
           toolchain: 1.98.0
           components: rustfmt, clippy
 
+      - name: Verify SQLx TLS support
+        shell: bash
+        run: |
+                cargo metadata --format-version 1 --no-deps \
+                  | jq -e '
+                      .packages[]
+                      | select(.name == "agro-ops-backend")
+                      | .dependencies[]
+                      | select(.name == "sqlx")
+                      | .features
+                      | index("tls-rustls-ring-webpki") != null
+                    '
+
+
       - name: Install SQLx CLI
         run: >-
           cargo install sqlx-cli --version 0.9.0 --no-default-features
