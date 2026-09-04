@@ -122,6 +122,32 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
+  backend-docker-smoke:
+    name: Backend Docker smoke
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0
+
+      - name: Install SQLx CLI
+        run: >-
+          cargo install sqlx-cli --version 0.9.0 --no-default-features
+          --features rustls,postgres --locked
+
+      - name: Build backend production runtime image
+        run: >-
+          docker build --target runtime --tag agro-ops-backend:smoke
+          services/backend
+
+      - name: Smoke backend production image
+        run: bash scripts/backend-docker-smoke.sh
+
   frontend-web:
     name: Frontend Web
     runs-on: ubuntu-latest
