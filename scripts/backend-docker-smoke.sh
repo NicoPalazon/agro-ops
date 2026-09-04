@@ -15,6 +15,7 @@ network_name="agro-ops-smoke-${run_id}"
 postgres_container="agro-ops-smoke-postgres-${run_id}"
 api_container="agro-ops-smoke-api-${run_id}"
 worker_container="agro-ops-smoke-worker-${run_id}"
+postgres_volume="agro-ops-smoke-postgres-data-${run_id}"
 temporary_dir="$(mktemp -d)"
 containers=()
 
@@ -22,8 +23,11 @@ cleanup() {
     local container attempt
 
     for container in "${containers[@]}"; do
-        docker rm --force "${container}" >/dev/null 2>&1 || true
+        docker rm --force --volumes "${container}" >/dev/null 2>&1 || true
     done
+
+    docker volume rm --force "${postgres_volume}" >/dev/null 2>&1 || true
+
     for attempt in {1..5}; do
         if docker network rm "${network_name}" >/dev/null 2>&1; then
             break
@@ -111,7 +115,10 @@ assert_startup_fails() {
 
 docker network create "${network_name}" >/dev/null
 
+docker volume create "${postgres_volume}" >/dev/null
+
 docker run --detach --name "${postgres_container}" --network "${network_name}" --network-alias postgres \
+    --mount type=volume,source="${postgres_volume}",target=/var/lib/postgresql/data \
     --env "POSTGRES_USER=${postgres_user}" \
     --env "POSTGRES_PASSWORD=${postgres_password}" \
     --env "POSTGRES_DB=${postgres_database}" \
