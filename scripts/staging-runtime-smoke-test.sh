@@ -55,4 +55,42 @@ missing_version="$(backend_version <(printf '[dependencies]\n'))"
 [[ -z "${missing_version}" ]] \
     || fail_test "manifest without a package version returned a value"
 
+smoke_test_temp_dir="$(mktemp -d)"
+trap 'rm -rf "${smoke_test_temp_dir}"' EXIT
+printf '%s\n' '{"access_token":"test-access-token"}' >"${smoke_test_temp_dir}/valid-auth.json"
+[[ "$(access_token_from_response "${smoke_test_temp_dir}/valid-auth.json")" == "test-access-token" ]] \
+    || fail_test "access token was not parsed from a valid Supabase response"
+
+printf '%s\n' '{"access_token":""}' >"${smoke_test_temp_dir}/invalid-auth.json"
+if access_token_from_response "${smoke_test_temp_dir}/invalid-auth.json" >/dev/null 2>&1; then
+    fail_test "empty access token was accepted"
+fi
+
+smoke_temp_dir="${smoke_test_temp_dir}"
+export STAGING_SUPABASE_URL="https://project.supabase.co"
+export STAGING_SUPABASE_PUBLISHABLE_KEY="sb_publishable_test"
+export STAGING_SMOKE_EMAIL="smoke@example.test"
+export STAGING_SMOKE_PASSWORD="fixture-password"
+curl() {
+    local argument output_path=""
+    local next_is_output=false
+
+    for argument in "$@"; do
+        if [[ "${next_is_output}" == true ]]; then
+            output_path="${argument}"
+            next_is_output=false
+        elif [[ "${argument}" == "--output" ]]; then
+            next_is_output=true
+        fi
+    done
+
+    printf '%s\n' '{"access_token":"fresh-test-access-token"}' >"${output_path}"
+    printf '200'
+}
+
+authenticate_smoke_user
+[[ "${smoke_access_token}" == "fresh-test-access-token" ]] \
+    || fail_test "fresh Supabase access token was not retained for private requests"
+unset -f curl
+
 echo "staging runtime smoke unit tests passed"

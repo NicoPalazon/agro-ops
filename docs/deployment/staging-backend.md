@@ -35,7 +35,7 @@ service-role key and no service-role key is required for this deployment.
 3. Create the API and worker services, connect both to this repository, and configure each service using the contract above.
 4. Generate public networking only for the API service after it is listening on Railway's injected `PORT`.
 5. Create a Railway project token scoped to staging and add these GitHub `staging` environment secrets: `RAILWAY_TOKEN`, `RAILWAY_PROJECT_ID`, `RAILWAY_API_SERVICE_ID`, and `RAILWAY_WORKER_SERVICE_ID`.
-6. Add the API HTTPS origin, with no trailing path, as the GitHub `staging` environment variable `STAGING_API_BASE_URL`.
+6. Add the API HTTPS origin, with no trailing path, as the GitHub `staging` environment variable `STAGING_API_BASE_URL`. Add `STAGING_SUPABASE_URL` and `STAGING_SUPABASE_PUBLISHABLE_KEY` as `staging` environment variables. Add `STAGING_SMOKE_EMAIL` and `STAGING_SMOKE_PASSWORD` as `staging` environment secrets for a dedicated enabled Supabase Auth smoke-test user. The runtime smoke exchanges those credentials for a fresh access token; do not store an access token or a service-role key in GitHub.
 7. Run `Deploy staging backend`, then run `Staging runtime smoke`.
 
 The deployment workflow uploads `services/backend` as the build root and waits for both Railway deployments to succeed. It assumes the account-specific service commands, variables, healthcheck, and API domain have already been configured; it does not create or guess provider resources.
