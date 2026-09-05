@@ -64,7 +64,7 @@ perform_request() {
         --max-time 10
         --output "${smoke_temp_dir}/response-body.json"
         --dump-header "${smoke_temp_dir}/response-headers.txt"
-        --write-out "%{http_code} %{http_version}"
+        --write-out "%{http_code} %{http_version}\n"
     )
 
     if [[ -n "${correlation_id}" ]]; then

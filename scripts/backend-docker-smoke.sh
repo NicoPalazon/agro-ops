@@ -109,6 +109,42 @@ wait_for_stale_worker() {
     fail "stopped worker did not become stale within 30 seconds"
 }
 
+worker_heartbeat_snapshot() {
+    docker exec "${postgres_container}" \
+        psql --username "${postgres_user}" --dbname "${postgres_database}" \
+        --tuples-only --no-align \
+        --command "SELECT count(*), EXTRACT(EPOCH FROM max(last_seen_at)) FROM service_heartbeats WHERE service_name = 'worker';"
+}
+
+assert_worker_heartbeat_row() {
+    local expected_timestamp_comparison="$1"
+    local snapshot row_count last_seen_epoch timestamp_updated
+
+    snapshot="$(worker_heartbeat_snapshot)"
+    IFS='|' read -r row_count last_seen_epoch <<<"${snapshot}"
+    [[ "${row_count}" == "1" ]] || fail "expected exactly one persisted worker heartbeat row, found ${row_count}"
+
+    if [[ -n "${expected_timestamp_comparison}" ]]; then
+        timestamp_updated="$(docker exec "${postgres_container}" \
+            psql --username "${postgres_user}" --dbname "${postgres_database}" \
+            --tuples-only --no-align \
+            --command "SELECT (EXTRACT(EPOCH FROM last_seen_at) > ${expected_timestamp_comparison})::int FROM service_heartbeats WHERE service_name = 'worker';")"
+        [[ "${timestamp_updated}" == "1" ]] \
+            || fail "restarted worker did not update the existing heartbeat row"
+    fi
+
+    printf '%s\n' "${last_seen_epoch}"
+}
+
+start_worker() {
+    docker run --detach --name "${worker_container}" --network "${network_name}" \
+        --env APP_ENV=staging \
+        --env "DATABASE_URL=${container_database_url}" \
+        --env WORKER_HEARTBEAT_INTERVAL_SECONDS=1 \
+        "${image_tag}" worker >/dev/null
+    containers+=("${worker_container}")
+}
+
 assert_container_exited_zero() {
     local container="$1"
     local service="$2"
@@ -168,21 +204,22 @@ docker run --detach --name "${api_container}" --network "${network_name}" \
     "${image_tag}" api >/dev/null
 containers+=("${api_container}")
 
-docker run --detach --name "${worker_container}" --network "${network_name}" \
-    --env APP_ENV=staging \
-    --env "DATABASE_URL=${container_database_url}" \
-    --env WORKER_HEARTBEAT_INTERVAL_SECONDS=1 \
-    "${image_tag}" worker >/dev/null
-containers+=("${worker_container}")
+start_worker
 
 wait_for_http_200 /health
 wait_for_http_200 /ready
 wait_for_http_200 /version
 wait_for_healthy_worker
+initial_heartbeat_epoch="$(assert_worker_heartbeat_row '')"
 
 docker stop --time 10 "${worker_container}" >/dev/null
 assert_container_exited_zero "${worker_container}" worker
 wait_for_stale_worker
+
+docker rm "${worker_container}" >/dev/null
+start_worker
+wait_for_healthy_worker
+assert_worker_heartbeat_row "${initial_heartbeat_epoch}" >/dev/null
 
 docker stop --time 10 "${api_container}" >/dev/null
 assert_container_exited_zero "${api_container}" API
