@@ -32,3 +32,5 @@ temp/
 
 # pnpm local stores
 **/.pnpm-store/
+.vercel
+.env*

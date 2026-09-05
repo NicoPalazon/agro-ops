@@ -22,11 +22,14 @@ export async function proxy(request: NextRequest) {
       },
     },
   });
+  // getClaims cryptographically verifies the access token against Supabase's
+  // signing keys while this SSR client persists any refreshed cookies. The
+  // authenticated request only needs claims here, not a user-profile lookup.
   const {
-    data: { user },
-  } = await supabase.auth.getUser();
+    data: claims,
+  } = await supabase.auth.getClaims();
 
-  if (request.nextUrl.pathname.startsWith("/internal") && !user) {
+  if (request.nextUrl.pathname.startsWith("/internal") && !claims) {
     const loginUrl = request.nextUrl.clone();
     loginUrl.pathname = "/login";
     loginUrl.search = "";

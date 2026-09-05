@@ -53,17 +53,17 @@ describe("System Status", () => {
   it("renders successful service states", async () => {
     vi.stubEnv("API_BASE_URL", "http://api:8080");
     const fetchMock = mockBackend({
-      "/health": { body: { status: "ok" } },
-      "/ready": { body: { status: "ready" } },
-      "/internal/worker/status": {
+      "/internal/system-status": {
         body: {
-          service: "worker",
-          status: "healthy",
-          last_seen_at: "2026-09-03T20:00:00.000000Z",
+          api: { status: "ok" },
+          database: { status: "ready" },
+          worker: {
+            service: "worker",
+            status: "healthy",
+            last_seen_at: "2026-09-03T20:00:00.000000Z",
+          },
+          version: { service: "agro-ops-backend", version: "0.1.0" },
         },
-      },
-      "/version": {
-        body: { service: "agro-ops-backend", version: "0.1.0" },
       },
     });
 
@@ -78,17 +78,14 @@ describe("System Status", () => {
       'data-service="worker" data-status="operational"',
     );
     expect(markup).toContain("0.1.0");
-    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(fetchMock).toHaveBeenCalledOnce();
     for (const [input, options] of fetchMock.mock.calls) {
       expect(options).toMatchObject({ cache: "no-store" });
       expect(options?.signal).toBeInstanceOf(AbortSignal);
-      if (new URL(input.toString()).pathname === "/internal/worker/status") {
-        expect(options).toMatchObject({
-          headers: { authorization: "Bearer authenticated-access-token" },
-        });
-      } else {
-        expect(options?.headers).toBeUndefined();
-      }
+      expect(new URL(input.toString()).pathname).toBe("/internal/system-status");
+      expect(options).toMatchObject({
+        headers: { authorization: "Bearer authenticated-access-token" },
+      });
     }
   });
 
@@ -97,17 +94,19 @@ describe("System Status", () => {
     const timeout = vi.fn(() => new AbortController().signal);
     vi.stubGlobal("AbortSignal", { timeout });
     mockBackend({
-      "/health": { body: { status: "ok" } },
-      "/ready": { body: { status: "ready" } },
-      "/internal/worker/status": {
-        body: { service: "worker", status: "healthy", last_seen_at: null },
+      "/internal/system-status": {
+        body: {
+          api: { status: "ok" },
+          database: { status: "ready" },
+          worker: { service: "worker", status: "healthy", last_seen_at: null },
+          version: { service: "agro-ops-backend", version: "0.1.0" },
+        },
       },
-      "/version": { body: { service: "agro-ops-backend", version: "0.1.0" } },
     });
 
     await SystemStatusPage();
 
-    expect(timeout).toHaveBeenCalledTimes(4);
+    expect(timeout).toHaveBeenCalledOnce();
     expect(timeout).toHaveBeenCalledWith(BACKEND_REQUEST_TIMEOUT_MS);
   });
 
@@ -131,16 +130,18 @@ describe("System Status", () => {
   it("does not display failed service checks as operational", async () => {
     vi.stubEnv("API_BASE_URL", "http://api:8080");
     mockBackend({
-      "/health": { status: 503, body: { status: "error" } },
-      "/ready": { status: 503, body: { status: "not_ready" } },
-      "/internal/worker/status": {
+      "/internal/system-status": {
         body: {
-          service: "worker",
-          status: "stale",
-          last_seen_at: "2026-09-03T19:59:00.000000Z",
+          api: { status: "error" },
+          database: { status: "not_ready" },
+          worker: {
+            service: "worker",
+            status: "stale",
+            last_seen_at: "2026-09-03T19:59:00.000000Z",
+          },
+          version: { service: "agro-ops-backend", version: "0.1.0" },
         },
       },
-      "/version": { status: 503, body: { status: "unavailable" } },
     });
 
     const markup = renderToStaticMarkup(await SystemStatusPage());
@@ -158,19 +159,15 @@ describe("System Status", () => {
     );
   });
 
-  it("does not display an authentication failure as Worker Operational", async () => {
+  it("does not display a failed aggregate check as operational", async () => {
     vi.stubEnv("API_BASE_URL", "http://api:8080");
     mockBackend({
-      "/health": { body: { status: "ok" } },
-      "/ready": { body: { status: "ready" } },
-      "/internal/worker/status": { status: 401, body: {} },
-      "/version": {
-        body: { service: "agro-ops-backend", version: "0.1.0" },
-      },
+      "/internal/system-status": { status: 401, body: {} },
     });
 
     const markup = renderToStaticMarkup(await SystemStatusPage());
 
+    expect(markup).toContain('data-service="api" data-status="degraded"');
     expect(markup).toContain('data-service="worker" data-status="degraded"');
     expect(markup).not.toContain(
       'data-service="worker" data-status="operational"',

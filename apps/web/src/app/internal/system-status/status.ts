@@ -66,15 +66,16 @@ function simpleServiceCheck(
   service: "api" | "database",
   label: string,
   result: FetchResult,
+  payload: unknown,
   expectedStatus: string,
 ): ServiceCheck {
   if (result.outcome === "unavailable") {
     return { service, label, status: "unavailable", detail: unavailableDetail };
   }
 
-  const payload = record(result.data);
+  const servicePayload = record(payload);
 
-  if (result.outcome === "success" && payload?.status === expectedStatus) {
+  if (result.outcome === "success" && servicePayload?.status === expectedStatus) {
     return {
       service,
       label,
@@ -91,7 +92,7 @@ function simpleServiceCheck(
   };
 }
 
-function workerServiceCheck(result: FetchResult): ServiceCheck {
+function workerServiceCheck(result: FetchResult, payload: unknown): ServiceCheck {
   if (result.outcome === "unavailable") {
     return {
       service: "worker",
@@ -101,10 +102,12 @@ function workerServiceCheck(result: FetchResult): ServiceCheck {
     };
   }
 
-  const payload = record(result.data);
-  const status = payload?.status;
+  const workerPayload = record(payload);
+  const status = workerPayload?.status;
   const lastSeenAt =
-    typeof payload?.last_seen_at === "string" ? payload.last_seen_at : null;
+    typeof workerPayload?.last_seen_at === "string"
+      ? workerPayload.last_seen_at
+      : null;
 
   if (
     result.outcome === "success" &&
@@ -128,23 +131,19 @@ function workerServiceCheck(result: FetchResult): ServiceCheck {
   };
 }
 
-function backendVersion(result: FetchResult): string | null {
-  const payload = record(result.data);
+function backendVersion(result: FetchResult, payload: unknown): string | null {
+  const versionPayload = record(payload);
 
-  return result.outcome === "success" && typeof payload?.version === "string"
-    ? payload.version
+  return result.outcome === "success" && typeof versionPayload?.version === "string"
+    ? versionPayload.version
     : null;
 }
 
 export async function loadSystemStatus(
   accessToken: string | null,
 ): Promise<SystemStatusModel> {
-  const [health, readiness, worker, version] = await Promise.all([
-    fetchInternal("/health"),
-    fetchInternal("/ready"),
-    fetchInternal("/internal/worker/status", accessToken),
-    fetchInternal("/version"),
-  ]);
+  const result = await fetchInternal("/internal/system-status", accessToken);
+  const payload = record(result.data);
 
   return {
     services: [
@@ -154,10 +153,10 @@ export async function loadSystemStatus(
         status: "operational",
         detail: "The Internal Console rendered successfully.",
       },
-      simpleServiceCheck("api", "API", health, "ok"),
-      simpleServiceCheck("database", "Database", readiness, "ready"),
-      workerServiceCheck(worker),
+      simpleServiceCheck("api", "API", result, payload?.api, "ok"),
+      simpleServiceCheck("database", "Database", result, payload?.database, "ready"),
+      workerServiceCheck(result, payload?.worker),
     ],
-    backendVersion: backendVersion(version),
+    backendVersion: backendVersion(result, payload?.version),
   };
 }

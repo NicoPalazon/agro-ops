@@ -2,14 +2,14 @@ import { NextRequest } from "next/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const auth = vi.hoisted(() => ({
-  getUser: vi.fn(),
+  getClaims: vi.fn(),
   setCookies: vi.fn(),
 }));
 
 vi.mock("@supabase/ssr", () => ({
   createServerClient: vi.fn((_url, _key, options) => {
     auth.setCookies.mockImplementation((cookies) => options.cookies.setAll(cookies));
-    return { auth: { getUser: auth.getUser } };
+    return { auth: { getClaims: auth.getClaims } };
   }),
 }));
 
@@ -18,7 +18,7 @@ import { proxy } from "./proxy";
 describe("private route proxy", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
-    auth.getUser.mockReset();
+    auth.getClaims.mockReset();
     auth.setCookies.mockReset();
   });
 
@@ -29,7 +29,7 @@ describe("private route proxy", () => {
   }
 
   it("redirects an anonymous deep link to login and preserves its return path", async () => {
-    auth.getUser.mockResolvedValue({ data: { user: null } });
+    auth.getClaims.mockResolvedValue({ data: null });
 
     const response = await proxy(request("/internal/system-status?tab=worker"));
     const location = new URL(response.headers.get("location")!);
@@ -42,7 +42,7 @@ describe("private route proxy", () => {
   });
 
   it("lets an authenticated user reach the requested internal page", async () => {
-    auth.getUser.mockResolvedValue({ data: { user: { id: "user-id" } } });
+    auth.getClaims.mockResolvedValue({ data: { claims: { sub: "user-id" } } });
 
     const response = await proxy(request("/internal/system-status"));
 
@@ -51,7 +51,7 @@ describe("private route proxy", () => {
   });
 
   it("preserves Supabase cookie mutations on an anonymous redirect", async () => {
-    auth.getUser.mockImplementation(async () => {
+    auth.getClaims.mockImplementation(async () => {
       auth.setCookies([
         {
           name: "sb-auth-token",
@@ -59,7 +59,7 @@ describe("private route proxy", () => {
           options: { maxAge: 0, path: "/" },
         },
       ]);
-      return { data: { user: null } };
+      return { data: null };
     });
 
     const response = await proxy(request("/internal"));
@@ -67,5 +67,14 @@ describe("private route proxy", () => {
     expect(response.status).toBe(307);
     expect(response.headers.get("set-cookie")).toContain("sb-auth-token=");
     expect(response.headers.get("set-cookie")).toContain("Max-Age=0");
+  });
+
+  it("does not allow invalid or expired claims through private route protection", async () => {
+    auth.getClaims.mockResolvedValue({ data: null });
+
+    const response = await proxy(request("/internal"));
+
+    expect(response.status).toBe(307);
+    expect(auth.getClaims).toHaveBeenCalledOnce();
   });
 });

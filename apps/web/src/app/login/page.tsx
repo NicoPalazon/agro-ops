@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { safeReturnPath } from "@/lib/auth/return-path";
 import { login } from "./actions";
 import styles from "./login.module.css";
+import { LoginSubmitButton } from "./submit-button";
 
 export const metadata: Metadata = {
   title: "Sign in | Agro Ops",
@@ -40,7 +41,7 @@ export default async function LoginPage({ searchParams }: LoginPageProps) {
               type="password"
             />
           </label>
-          <button type="submit">Sign in</button>
+          <LoginSubmitButton />
         </form>
       </section>
     </main>

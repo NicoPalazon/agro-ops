@@ -48,6 +48,22 @@ You can check out [the Next.js GitHub repository](https://github.com/vercel/next
 
 ## Deploy on Vercel
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+Create the Vercel project from this repository with **Root Directory** set to
+`apps/web`. Vercel detects the Next.js framework and the app's local pnpm lockfile;
+leave the build command at its default (`pnpm build`).
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+For the `feat/walking-skeleton` Preview deployment, configure these environment
+variables with the **Preview** target:
+
+| Name | Value |
+| --- | --- |
+| `NEXT_PUBLIC_SUPABASE_URL` | URL of the existing staging Supabase project |
+| `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | Publishable/anon key of that staging Supabase project |
+| `API_BASE_URL` | `https://agro-ops-staging.up.railway.app` |
+
+`API_BASE_URL` is deliberately server-only: it is used by server-rendered
+backend status requests and must not be prefixed with `NEXT_PUBLIC_`. Do not add
+a Supabase service-role key, or any other privileged credential, to Vercel.
+
+The application validates these values during production builds, requires HTTPS
+outside local development, and fails the build if any required value is missing.
