@@ -15,9 +15,13 @@ network_name="agro-ops-smoke-${run_id}"
 postgres_container="agro-ops-smoke-postgres-${run_id}"
 api_container="agro-ops-smoke-api-${run_id}"
 worker_container="agro-ops-smoke-worker-${run_id}"
+supabase_auth_container="agro-ops-smoke-supabase-auth-${run_id}"
 postgres_volume="agro-ops-smoke-postgres-data-${run_id}"
 temporary_dir="$(mktemp -d)"
 containers=()
+smoke_access_token="ci-smoke-access-token"
+smoke_publishable_key="sb_publishable_ci_smoke"
+supabase_auth_url="http://supabase-auth:8080"
 
 cleanup() {
     local container attempt
@@ -58,6 +62,35 @@ wait_for_postgres() {
     fail "PostgreSQL did not become ready within 30 seconds"
 }
 
+wait_for_host_postgres() {
+    local attempt
+
+    for attempt in {1..30}; do
+        if DATABASE_URL="${migration_database_url}" \
+            sqlx migrate info --source "${backend_dir}/migrations" >/dev/null 2>&1; then
+            return
+        fi
+        sleep 1
+    done
+
+    fail "PostgreSQL host connection did not become ready within 30 seconds"
+}
+
+wait_for_container_running() {
+    local container="$1"
+    local attempt running
+
+    for attempt in {1..30}; do
+        running="$(docker inspect --format '{{.State.Running}}' "${container}" 2>/dev/null || true)"
+        if [[ "${running}" == "true" ]]; then
+            return
+        fi
+        sleep 1
+    done
+
+    fail "${container} did not remain running within 30 seconds"
+}
+
 wait_for_http_200() {
     local path="$1"
     local response_file="${temporary_dir}/$(tr '/' '_' <<<"${path}").json"
@@ -81,6 +114,7 @@ wait_for_healthy_worker() {
 
     for attempt in {1..30}; do
         status="$(curl --silent --show-error --output "${response_file}" --write-out '%{http_code}' \
+            --header "Authorization: Bearer ${smoke_access_token}" \
             "http://127.0.0.1:${api_port}/internal/worker/status" 2>/dev/null || true)"
         if [[ "${status}" == "200" ]] \
             && grep --fixed-strings --quiet '"status":"healthy"' "${response_file}"; then
@@ -98,6 +132,7 @@ wait_for_stale_worker() {
 
     for attempt in {1..30}; do
         status="$(curl --silent --show-error --output "${response_file}" --write-out '%{http_code}' \
+            --header "Authorization: Bearer ${smoke_access_token}" \
             "http://127.0.0.1:${api_port}/internal/worker/status" 2>/dev/null || true)"
         if [[ "${status}" == "200" ]] \
             && grep --fixed-strings --quiet '"status":"stale"' "${response_file}"; then
@@ -107,6 +142,21 @@ wait_for_stale_worker() {
     done
 
     fail "stopped worker did not become stale within 30 seconds"
+}
+
+assert_worker_status_requires_authentication() {
+    local status
+
+    status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+        "http://127.0.0.1:${api_port}/internal/worker/status" 2>/dev/null || true)"
+    [[ "${status}" == "401" ]] \
+        || fail "worker status without a bearer token returned HTTP ${status}, expected 401"
+}
+
+assert_mock_received_authenticated_request() {
+    docker logs "${supabase_auth_container}" 2>&1 \
+        | grep --fixed-strings --quiet 'verified /auth/v1/user request' \
+        || fail "API did not verify the synthetic bearer token through mock Supabase Auth"
 }
 
 worker_heartbeat_snapshot() {
@@ -193,14 +243,50 @@ containers+=("${postgres_container}")
 wait_for_postgres
 
 postgres_port="$(docker inspect --format '{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}' "${postgres_container}")"
-migration_database_url="postgres://${postgres_user}:${postgres_password}@127.0.0.1:${postgres_port}/${postgres_database}"
+migration_database_url="postgres://${postgres_user}:${postgres_password}@127.0.0.1:${postgres_port}/${postgres_database}?sslmode=disable"
+wait_for_host_postgres
 DATABASE_URL="${migration_database_url}" sqlx migrate run --source "${backend_dir}/migrations"
+
+docker run --detach --name "${supabase_auth_container}" --network "${network_name}" --network-alias supabase-auth \
+    --env "SMOKE_ACCESS_TOKEN=${smoke_access_token}" \
+    --env "SMOKE_PUBLISHABLE_KEY=${smoke_publishable_key}" \
+    python:3.13-alpine \
+    python -c '
+import os
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class SupabaseAuthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != "/auth/v1/user":
+            self.send_error(404)
+            return
+        expected_authorization = "Bearer " + os.environ["SMOKE_ACCESS_TOKEN"]
+        if self.headers.get("Authorization") != expected_authorization or self.headers.get("apikey") != os.environ["SMOKE_PUBLISHABLE_KEY"]:
+            self.send_error(401)
+            return
+        body = b"{\"id\":\"ci-smoke-user\"}"
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        print("verified /auth/v1/user request", flush=True)
+
+    def log_message(self, format, *args):
+        pass
+
+HTTPServer(("0.0.0.0", 8080), SupabaseAuthHandler).serve_forever()
+' >/dev/null
+containers+=("${supabase_auth_container}")
+wait_for_container_running "${supabase_auth_container}"
 
 docker run --detach --name "${api_container}" --network "${network_name}" \
     --publish "127.0.0.1:${api_port}:${api_port}" \
-    --env APP_ENV=staging \
+    --env APP_ENV=local \
     --env "DATABASE_URL=${container_database_url}" \
     --env "PORT=${api_port}" \
+    --env "SUPABASE_URL=${supabase_auth_url}" \
+    --env "SUPABASE_PUBLISHABLE_KEY=${smoke_publishable_key}" \
     "${image_tag}" api >/dev/null
 containers+=("${api_container}")
 
@@ -209,7 +295,9 @@ start_worker
 wait_for_http_200 /health
 wait_for_http_200 /ready
 wait_for_http_200 /version
+assert_worker_status_requires_authentication
 wait_for_healthy_worker
+assert_mock_received_authenticated_request
 initial_heartbeat_epoch="$(assert_worker_heartbeat_row '')"
 
 docker stop --time 10 "${worker_container}" >/dev/null
