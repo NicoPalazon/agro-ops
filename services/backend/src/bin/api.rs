@@ -1,9 +1,14 @@
 use std::net::SocketAddr;
 
 use agro_ops_backend::{
-    AppState, app, config::RuntimeConfig, shutdown::shutdown_signal, telemetry::init_tracing,
+    AppState, app,
+    auth::SupabaseAuthVerifier,
+    config::{RuntimeConfig, SupabaseAuthConfig},
+    shutdown::shutdown_signal,
+    telemetry::init_tracing,
 };
 use sqlx::postgres::PgPoolOptions;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
@@ -16,6 +21,18 @@ async fn main() {
         std::process::exit(1);
     });
 
+    let auth_config =
+        SupabaseAuthConfig::from_env(config.app_environment()).unwrap_or_else(|error| {
+            error!(service = "api", %error, "startup authentication configuration invalid");
+            std::process::exit(1);
+        });
+    let auth = SupabaseAuthVerifier::new(&auth_config).unwrap_or_else(|_| {
+        error!(
+            service = "api",
+            "startup authentication configuration invalid"
+        );
+        std::process::exit(1);
+    });
     let db = PgPoolOptions::new()
         .max_connections(5)
         .connect_lazy(config.database_url())
@@ -26,8 +43,10 @@ async fn main() {
             );
             std::process::exit(1);
         });
-
-    let state = AppState { db };
+    let state = AppState {
+        db,
+        auth: Arc::new(auth),
+    };
 
     let address = SocketAddr::from(([0, 0, 0, 0], config.port()));
 

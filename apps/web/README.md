@@ -1,5 +1,22 @@
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
+## Authentication configuration
+
+The Internal Console uses Supabase Auth with email/password accounts only. Set
+`NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`, and
+`API_BASE_URL` before running or building the web application. The public values
+must be the URL and publishable key for the matching Supabase project; never use
+a service-role key here. Create and enable the allowed accounts in Supabase—this
+application intentionally provides no sign-up screen or local authentication bypass.
+
+Unauthenticated requests to `/internal/*` redirect to `/login`. Supabase SSR
+cookies persist the authenticated session, and System Status forwards its access
+token only to the protected worker-status endpoint.
+
+The backend OpenAPI document at `/openapi.json` is also private. Retrieve it with
+an enabled user's Supabase access token as `Authorization: Bearer <token>`; do not
+use a service-role key.
+
 ## Getting Started
 
 First, run the development server:

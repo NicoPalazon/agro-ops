@@ -1,4 +1,5 @@
 import styles from "../internal.module.css";
+import { authenticatedAccessToken } from "@/lib/auth/server";
 import { loadSystemStatus, type DisplayStatus } from "./status";
 
 const statusLabels: Record<DisplayStatus, string> = {
@@ -9,7 +10,7 @@ const statusLabels: Record<DisplayStatus, string> = {
 };
 
 export default async function SystemStatusPage() {
-  const status = await loadSystemStatus();
+  const status = await loadSystemStatus(await authenticatedAccessToken());
 
   return (
     <>

@@ -47,6 +47,8 @@ services:
       APP_ENV: local
       PORT: 8080
       DATABASE_URL: postgres://agro_ops:agro_ops@postgres:5432/agro_ops
+      SUPABASE_URL: ${SUPABASE_URL:-}
+      SUPABASE_PUBLISHABLE_KEY: ${SUPABASE_PUBLISHABLE_KEY:-}
       RUST_LOG: info
 
     ports:
@@ -110,6 +112,8 @@ services:
 
     environment:
       API_BASE_URL: http://api:8080
+      NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-}
+      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY:-}
 
     command:
       - sh

@@ -1,3 +1,5 @@
+import { apiBaseUrl } from "@/lib/supabase/env";
+
 export type DisplayStatus =
   | "operational"
   | "degraded"
@@ -22,17 +24,23 @@ interface FetchResult {
 }
 
 const unavailableDetail = "The check could not reach the backend.";
+export const BACKEND_REQUEST_TIMEOUT_MS = 5_000;
 
-async function fetchInternal(path: string): Promise<FetchResult> {
-  const apiBaseUrl = process.env.API_BASE_URL;
+async function fetchInternal(
+  path: string,
+  accessToken?: string | null,
+): Promise<FetchResult> {
+  const baseUrl = apiBaseUrl();
 
-  if (!apiBaseUrl) {
+  if (!baseUrl) {
     return { outcome: "unavailable" };
   }
 
   try {
-    const response = await fetch(new URL(path, apiBaseUrl), {
+    const response = await fetch(new URL(path, baseUrl), {
       cache: "no-store",
+      headers: accessToken ? { authorization: `Bearer ${accessToken}` } : undefined,
+      signal: AbortSignal.timeout(BACKEND_REQUEST_TIMEOUT_MS),
     });
 
     if (!response.ok) {
@@ -128,11 +136,13 @@ function backendVersion(result: FetchResult): string | null {
     : null;
 }
 
-export async function loadSystemStatus(): Promise<SystemStatusModel> {
+export async function loadSystemStatus(
+  accessToken: string | null,
+): Promise<SystemStatusModel> {
   const [health, readiness, worker, version] = await Promise.all([
     fetchInternal("/health"),
     fetchInternal("/ready"),
-    fetchInternal("/internal/worker/status"),
+    fetchInternal("/internal/worker/status", accessToken),
     fetchInternal("/version"),
   ]);
 

@@ -37,6 +37,10 @@ pub enum ConfigError {
     MissingDatabaseUrl,
     InvalidPort,
     InvalidWorkerHeartbeatInterval,
+    MissingSupabaseUrl,
+    InvalidSupabaseUrl,
+    InsecureSupabaseUrl,
+    MissingSupabasePublishableKey,
 }
 
 impl fmt::Display for ConfigError {
@@ -54,7 +58,89 @@ impl fmt::Display for ConfigError {
             Self::InvalidWorkerHeartbeatInterval => formatter.write_str(
                 "invalid configuration: WORKER_HEARTBEAT_INTERVAL_SECONDS must be a positive integer",
             ),
+            Self::MissingSupabaseUrl => {
+                formatter.write_str("invalid configuration: SUPABASE_URL is required for API authentication")
+            }
+            Self::InvalidSupabaseUrl => formatter.write_str(
+                "invalid configuration: SUPABASE_URL must be an absolute HTTP(S) URL",
+            ),
+            Self::InsecureSupabaseUrl => formatter.write_str(
+                "invalid configuration: SUPABASE_URL must use HTTPS outside local development",
+            ),
+            Self::MissingSupabasePublishableKey => formatter.write_str(
+                "invalid configuration: SUPABASE_PUBLISHABLE_KEY is required for API authentication",
+            ),
         }
+    }
+}
+
+#[derive(Clone)]
+pub struct SupabaseAuthConfig {
+    url: String,
+    publishable_key: String,
+}
+
+impl SupabaseAuthConfig {
+    pub fn from_env(app_environment: AppEnvironment) -> Result<Self, ConfigError> {
+        Self::from_lookup(app_environment, |key| std::env::var(key).ok())
+    }
+
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub fn publishable_key(&self) -> &str {
+        &self.publishable_key
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_values(
+        app_environment: AppEnvironment,
+        url: impl Into<String>,
+        publishable_key: impl Into<String>,
+    ) -> Result<Self, ConfigError> {
+        let url = url.into();
+        let publishable_key = publishable_key.into();
+
+        Self::from_lookup(app_environment, |key| match key {
+            "SUPABASE_URL" => Some(url.clone()),
+            "SUPABASE_PUBLISHABLE_KEY" => Some(publishable_key.clone()),
+            _ => None,
+        })
+    }
+
+    fn from_lookup<F>(app_environment: AppEnvironment, lookup: F) -> Result<Self, ConfigError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let url = lookup("SUPABASE_URL")
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(ConfigError::MissingSupabaseUrl)?;
+        let parsed_url = reqwest::Url::parse(&url).map_err(|_| ConfigError::InvalidSupabaseUrl)?;
+        if !matches!(parsed_url.scheme(), "http" | "https") || parsed_url.host().is_none() {
+            return Err(ConfigError::InvalidSupabaseUrl);
+        }
+        if app_environment != AppEnvironment::Local && parsed_url.scheme() != "https" {
+            return Err(ConfigError::InsecureSupabaseUrl);
+        }
+        let publishable_key = lookup("SUPABASE_PUBLISHABLE_KEY")
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(ConfigError::MissingSupabasePublishableKey)?;
+
+        Ok(Self {
+            url,
+            publishable_key,
+        })
+    }
+}
+
+impl fmt::Debug for SupabaseAuthConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SupabaseAuthConfig")
+            .field("url", &self.url)
+            .field("publishable_key", &"[REDACTED]")
+            .finish()
     }
 }
 
@@ -275,5 +361,60 @@ mod tests {
             config(&[("DATABASE_URL", DATABASE_URL)]).expect("configuration must be valid");
 
         assert!(!format!("{config:?}").contains(DATABASE_URL));
+    }
+
+    #[test]
+    fn requires_supabase_auth_configuration() {
+        let error = SupabaseAuthConfig::from_lookup(AppEnvironment::Local, |_| None)
+            .expect_err("authentication configuration must be required by the API");
+
+        assert_eq!(error, ConfigError::MissingSupabaseUrl);
+    }
+
+    #[test]
+    fn reads_and_redacts_supabase_auth_configuration() {
+        let config = SupabaseAuthConfig::from_lookup(AppEnvironment::Local, |key| match key {
+            "SUPABASE_URL" => Some("https://project.supabase.co".to_owned()),
+            "SUPABASE_PUBLISHABLE_KEY" => Some("sb_publishable_test".to_owned()),
+            _ => None,
+        })
+        .expect("authentication configuration must be valid");
+
+        assert_eq!(config.url(), "https://project.supabase.co");
+        assert_eq!(config.publishable_key(), "sb_publishable_test");
+        assert!(!format!("{config:?}").contains("sb_publishable_test"));
+    }
+
+    #[test]
+    fn rejects_an_invalid_supabase_url() {
+        let error = SupabaseAuthConfig::from_lookup(AppEnvironment::Local, |key| match key {
+            "SUPABASE_URL" => Some("not a URL".to_owned()),
+            "SUPABASE_PUBLISHABLE_KEY" => Some("sb_publishable_test".to_owned()),
+            _ => None,
+        })
+        .expect_err("an invalid Supabase URL must fail startup validation");
+
+        assert_eq!(error, ConfigError::InvalidSupabaseUrl);
+    }
+
+    #[test]
+    fn allows_http_supabase_urls_only_in_local_development() {
+        let local = SupabaseAuthConfig::from_values(
+            AppEnvironment::Local,
+            "http://127.0.0.1:54321",
+            "sb_publishable_test",
+        )
+        .expect("local Supabase development may use HTTP");
+        assert_eq!(local.url(), "http://127.0.0.1:54321");
+
+        for environment in [AppEnvironment::Staging, AppEnvironment::Production] {
+            let error = SupabaseAuthConfig::from_values(
+                environment,
+                "http://project.supabase.co",
+                "sb_publishable_test",
+            )
+            .expect_err("non-local Supabase authentication must use HTTPS");
+            assert_eq!(error, ConfigError::InsecureSupabaseUrl);
+        }
     }
 }

@@ -1,0 +1,25 @@
+.page {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 2rem;
+  background: #f4f6f2;
+}
+
+.card {
+  width: min(100%, 25rem);
+  padding: 2rem;
+  border: 1px solid #d9ded4;
+  border-radius: 0.75rem;
+  background: white;
+  box-shadow: 0 1rem 3rem rgb(25 40 30 / 10%);
+}
+
+.card h1 { margin: 0; color: #173d2b; }
+.card p { color: #526158; }
+
+.form { display: grid; gap: 1rem; margin-top: 1.5rem; }
+.form label { display: grid; gap: 0.4rem; font-weight: 600; color: #263b2e; }
+.form input { padding: 0.7rem; border: 1px solid #aeb9ae; border-radius: 0.35rem; font: inherit; }
+.form button { padding: 0.75rem 1rem; border: 0; border-radius: 0.35rem; background: #1d6845; color: white; font: inherit; font-weight: 700; cursor: pointer; }
+.error { color: #a12424; font-weight: 600; }

@@ -9,7 +9,7 @@ Configure both services with repository root directory `/services/backend`. Rail
 ### API service
 
 - Start command: `api`
-- Variables: `APP_ENV=staging`, `DATABASE_URL=<Supabase staging connection string>`, `RUST_LOG=info`
+- Variables: `APP_ENV=staging`, `DATABASE_URL=<Supabase staging connection string>`, `SUPABASE_URL=https://<staging-project>.supabase.co`, `SUPABASE_PUBLISHABLE_KEY=<staging publishable key>`, `RUST_LOG=info`
 - Port: use the `PORT` value injected by Railway; do not configure a fixed port
 - Healthcheck path: `/ready`
 - Public networking: generate a Railway domain or configure a verified custom domain
@@ -22,6 +22,11 @@ Configure both services with repository root directory `/services/backend`. Rail
 - HTTP healthcheck: none; worker health is the persisted PostgreSQL heartbeat read through the API
 
 Start commands remain service settings because one Railway config-as-code file describes one deployment and cannot safely express two different process commands for these two services.
+
+The API rejects plaintext `SUPABASE_URL` values outside `APP_ENV=local`.
+`/openapi.json` is authenticated: retrieve it with an enabled user's Supabase
+access token in `Authorization: Bearer <token>`. The publishable key is not a
+service-role key and no service-role key is required for this deployment.
 
 ## First deployment
 
