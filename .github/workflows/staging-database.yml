@@ -1,0 +1,48 @@
+name: Staging database
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  staging-database:
+    name: Migrate and smoke staging database
+    runs-on: ubuntu-latest
+    environment: staging
+    env:
+      DATABASE_URL: ${{ secrets.STAGING_DATABASE_URL }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Require staging database secret
+        shell: bash
+        run: |
+          if [[ -z "${DATABASE_URL}" ]]; then
+            echo "STAGING_DATABASE_URL is not configured in the staging environment." >&2
+            exit 1
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0
+
+      - name: Install SQLx CLI
+        run: >-
+          cargo install sqlx-cli --version 0.9.0 --no-default-features
+          --features rustls,postgres --locked
+
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes postgresql-client
+
+      - name: Apply repository migrations
+        run: sqlx migrate run --source services/backend/migrations
+
+      - name: Smoke staging database
+        run: bash scripts/staging-db-smoke.sh

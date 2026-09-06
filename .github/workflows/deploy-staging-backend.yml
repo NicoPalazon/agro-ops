@@ -1,0 +1,61 @@
+name: Deploy staging backend
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-staging-backend:
+    name: Deploy staging API and worker
+    runs-on: ubuntu-latest
+    environment: staging
+    env:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      RAILWAY_PROJECT_ID: ${{ secrets.RAILWAY_PROJECT_ID }}
+      RAILWAY_API_SERVICE_ID: ${{ secrets.RAILWAY_API_SERVICE_ID }}
+      RAILWAY_WORKER_SERVICE_ID: ${{ secrets.RAILWAY_WORKER_SERVICE_ID }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Require Railway deployment configuration
+        shell: bash
+        run: |
+          for variable_name in \
+            RAILWAY_TOKEN \
+            RAILWAY_PROJECT_ID \
+            RAILWAY_API_SERVICE_ID \
+            RAILWAY_WORKER_SERVICE_ID
+          do
+            if [[ -z "${!variable_name}" ]]; then
+              echo "${variable_name} is not configured in the staging environment." >&2
+              exit 1
+            fi
+          done
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli@5.47.2
+
+      - name: Deploy API
+        run: >-
+          railway up services/backend --path-as-root --ci
+          --project "${RAILWAY_PROJECT_ID}"
+          --environment staging
+          --service "${RAILWAY_API_SERVICE_ID}"
+          --message "GitHub Actions ${GITHUB_SHA}"
+
+      - name: Deploy worker
+        run: >-
+          railway up services/backend --path-as-root --ci
+          --project "${RAILWAY_PROJECT_ID}"
+          --environment staging
+          --service "${RAILWAY_WORKER_SERVICE_ID}"
+          --message "GitHub Actions ${GITHUB_SHA}"

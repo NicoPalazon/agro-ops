@@ -1,0 +1,144 @@
+services:
+  postgres:
+    image: postgis/postgis:17-3.5
+    container_name: agro-ops-postgres-dev
+
+    environment:
+      POSTGRES_USER: agro_ops
+      POSTGRES_PASSWORD: agro_ops
+      POSTGRES_DB: agro_ops
+
+    ports:
+      - "5432:5432"
+
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agro_ops -d agro_ops"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+    networks:
+      - agro-ops
+
+  api:
+    build:
+      context: ./services/backend
+      dockerfile: Dockerfile
+      target: dev
+      args:
+        LOCAL_UID: ${LOCAL_UID:-1000}
+        LOCAL_GID: ${LOCAL_GID:-1000}
+
+    image: agro-ops-backend-dev:latest
+    container_name: agro-ops-api-dev
+    init: true
+
+    working_dir: /app
+
+    command:
+      - bash
+      - scripts/dev-watch.sh
+      - api
+
+    environment:
+      APP_ENV: local
+      PORT: 8080
+      DATABASE_URL: postgres://agro_ops:agro_ops@postgres:5432/agro_ops
+      SUPABASE_URL: ${SUPABASE_URL:-}
+      SUPABASE_PUBLISHABLE_KEY: ${SUPABASE_PUBLISHABLE_KEY:-}
+      RUST_LOG: info
+
+    ports:
+      - "8080:8080"
+
+    volumes:
+      - ./services/backend:/app
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    networks:
+      - agro-ops
+
+  worker:
+    build:
+      context: ./services/backend
+      dockerfile: Dockerfile
+      target: dev
+      args:
+        LOCAL_UID: ${LOCAL_UID:-1000}
+        LOCAL_GID: ${LOCAL_GID:-1000}
+
+    image: agro-ops-backend-dev:latest
+    container_name: agro-ops-worker-dev
+    init: true
+
+    working_dir: /app
+
+    command:
+      - bash
+      - scripts/dev-watch.sh
+      - worker
+
+    environment:
+      APP_ENV: local
+      DATABASE_URL: postgres://agro_ops:agro_ops@postgres:5432/agro_ops
+      RUST_LOG: info
+
+    volumes:
+      - ./services/backend:/app
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    networks:
+      - agro-ops
+
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+
+    image: agro-ops-web-dev:latest
+    container_name: agro-ops-web-dev
+    init: true
+
+    working_dir: /app
+
+    environment:
+      API_BASE_URL: http://api:8080
+      NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-}
+      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY:-}
+
+    command:
+      - sh
+      - -c
+      - pnpm install --frozen-lockfile --store-dir /pnpm/store && pnpm dev --hostname 0.0.0.0
+
+    ports:
+      - "3000:3000"
+
+    volumes:
+      - ./apps/web:/app
+      - web-node-modules:/app/node_modules
+      - web-pnpm-store:/pnpm/store
+
+    networks:
+      - agro-ops
+
+volumes:
+  postgres-data:
+    name: agro-ops-postgres-data
+  web-node-modules:
+    name: agro-ops-web-node-modules
+  web-pnpm-store:
+    name: agro-ops-web-pnpm-store
+
+networks:
+  agro-ops:
+    name: agro-ops

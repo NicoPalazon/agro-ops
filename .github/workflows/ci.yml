@@ -66,3 +66,147 @@ jobs:
           fi
 
           echo "No local environment files are tracked."
+
+      - name: Test staging runtime smoke helpers
+        run: bash scripts/staging-runtime-smoke-test.sh
+  backend-rust:
+    name: Backend Rust
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgis/postgis:17-3.5
+        env:
+          POSTGRES_USER: agro_ops
+          POSTGRES_PASSWORD: agro_ops
+          POSTGRES_DB: agro_ops
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agro_ops -d agro_ops"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgres://agro_ops:agro_ops@localhost:5432/agro_ops
+
+    defaults:
+      run:
+        working-directory: services/backend
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0
+          components: rustfmt, clippy
+
+      - name: Verify SQLx TLS support
+        shell: bash
+        run: |
+                cargo metadata --format-version 1 --no-deps \
+                  | jq -e '
+                      .packages[]
+                      | select(.name == "agro-ops-backend")
+                      | .dependencies[]
+                      | select(.name == "sqlx")
+                      | .features
+                      | index("tls-rustls-ring-webpki") != null
+                    '
+
+
+      - name: Install SQLx CLI
+        run: >-
+          cargo install sqlx-cli --version 0.9.0 --no-default-features
+          --features rustls,postgres --locked
+
+      - name: Apply database migrations
+        run: sqlx migrate run --source migrations
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check compilation
+        run: cargo check --locked --all-targets
+
+      - name: Run tests
+        run: cargo test --locked --all-targets
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+  backend-docker-smoke:
+    name: Backend Docker smoke
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0
+
+      - name: Install SQLx CLI
+        run: >-
+          cargo install sqlx-cli --version 0.9.0 --no-default-features
+          --features rustls,postgres --locked
+
+      - name: Build backend production runtime image
+        run: >-
+          docker build --target runtime --tag agro-ops-backend:smoke
+          services/backend
+
+      - name: Smoke backend production image
+        run: bash scripts/backend-docker-smoke.sh
+
+  frontend-web:
+    name: Frontend Web
+    runs-on: ubuntu-latest
+
+    env:
+      NEXT_PUBLIC_SUPABASE_URL: https://ci-placeholder.supabase.co
+      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: sb_publishable_ci_placeholder
+      API_BASE_URL: https://api.example.invalid
+
+    defaults:
+      run:
+        working-directory: apps/web
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Verify pnpm version
+        run: test "$(pnpm --version)" = "11.25.0"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run lint
+        run: pnpm lint
+
+      - name: Generate Next.js route types
+        run: pnpm exec next typegen
+
+      - name: Run TypeScript typecheck
+        run: pnpm exec tsc --noEmit
+
+      - name: Run tests
+        run: pnpm test
+
+      - name: Build production application
+        run: pnpm build

@@ -8,6 +8,8 @@ node_modules/
 .next/
 out/
 coverage/
+test-results/
+playwright-report/
 
 # Rust
 target/
@@ -29,3 +31,8 @@ Thumbs.db
 *.sqlite3
 tmp/
 temp/
+
+# pnpm local stores
+**/.pnpm-store/
+.vercel
+.env*

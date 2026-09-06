@@ -1,0 +1,38 @@
+name: Staging auth browser E2E
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  staging-auth-e2e:
+    name: Verify staging login and private System Status
+    runs-on: ubuntu-latest
+    environment: staging
+    env:
+      STAGING_WEB_BASE_URL: ${{ vars.STAGING_WEB_BASE_URL }}
+      STAGING_SMOKE_EMAIL: ${{ secrets.STAGING_SMOKE_EMAIL }}
+      STAGING_SMOKE_PASSWORD: ${{ secrets.STAGING_SMOKE_PASSWORD }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Install pnpm
+        run: npm install --global pnpm@11.25.0
+
+      - name: Install frontend dependencies
+        run: pnpm --dir apps/web install --frozen-lockfile
+
+      - name: Install Chromium
+        run: pnpm --dir apps/web exec playwright install --with-deps chromium
+
+      - name: Run staging auth browser E2E
+        run: pnpm --dir apps/web run test:e2e:staging
