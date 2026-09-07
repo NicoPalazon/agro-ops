@@ -1,0 +1,198 @@
+---
+config:
+  layout: elk
+---
+erDiagram
+    direction TB
+
+    %% Complete master conceptual ERD; conceptual-model.md remains the authoritative detailed source.
+    %% Unresolved relationships are intentionally absent from the drawn edge set.
+    %% Physical schema design remains gated by conceptual-model.md §6; no attributes, keys, or SQL types appear here.
+
+    subgraph CORE["CORE / IDENTITY"]
+        ORGANIZATION
+        USER
+        EXTERNAL_AUTH_IDENTITY
+        ROLE
+        USER_ROLE
+        CAPABILITY
+        ROLE_CAPABILITY
+        AUDIT_EVENT
+        DOCUMENT
+        DOCUMENT_LINK
+        IDEMPOTENCY_RECORD
+        JOB
+        OUTBOX_EVENT
+        STORED_OBJECT
+        EXTERNAL_REFERENCE
+
+        ORGANIZATION ||..o{ USER : contains
+        USER ||..o{ EXTERNAL_AUTH_IDENTITY : maps
+        USER ||--o{ USER_ROLE : has_membership
+        ROLE ||--o{ USER_ROLE : assigned_in
+        ROLE ||--o{ ROLE_CAPABILITY : includes
+        CAPABILITY ||--o{ ROLE_CAPABILITY : granted_by
+        USER o|..o{ AUDIT_EVENT : acts_in
+        DOCUMENT ||--o{ DOCUMENT_LINK : has_link
+
+        %% UserRole, RoleCapability and DocumentLink are existence-dependent associations.
+        %% DocumentLink's business-record target remains generic/conceptual; no polymorphic FK is implied.
+        %% ExternalReference targets one local entity, but its generic target is not drawn as a false supertype.
+        %% OutboxEvent refers to a confirmed business change/aggregate; that generic source is not drawn.
+    end
+
+    subgraph TERRITORY["TERRITORY"]
+        ESTABLISHMENT
+        BASE_PLOT
+        CAMPAIGN
+        OPERATIONAL_UNIT
+        ACTIVITY_USE
+        OPERATIONAL_UNIT_USE
+
+        ESTABLISHMENT ||..o{ BASE_PLOT : contains
+        CAMPAIGN ||--o{ OPERATIONAL_UNIT : defines
+        OPERATIONAL_UNIT ||--o{ OPERATIONAL_UNIT_USE : has_use
+        ACTIVITY_USE ||--o{ OPERATIONAL_UNIT_USE : assigned_as
+
+        %% OperationalUnitUse is an identifying, history-preserving association.
+        %% Campaign-specific subdivision does not rewrite earlier Campaign geography.
+        %% Campaign <-> Establishment and BasePlot <-> OperationalUnit are intentionally unresolved.
+    end
+
+    subgraph INVENTORY["INVENTORY / GRAIN LEDGER"]
+        STOCK_OPERATION
+        INVENTORY_MOVEMENT
+        PRODUCT
+        DEPOT
+        UNIT_OF_MEASURE
+
+        STOCK_OPERATION ||--o{ INVENTORY_MOVEMENT : realizes
+        PRODUCT ||..o{ INVENTORY_MOVEMENT : affects
+        DEPOT ||..o{ INVENTORY_MOVEMENT : occurs_at
+
+        %% A confirmed StockOperation has one or more movements; a draft may have none.
+        %% Stock balance is derived from confirmed InventoryMovement facts and is not an entity.
+        %% Product <-> UnitOfMeasure cardinality remains unresolved; no conversion is implied.
+    end
+
+    subgraph AGRICULTURE["AGRICULTURE"]
+        AGRICULTURAL_WORK
+        FIELD_WORK_TYPE
+        WORK_INPUT_APPLICATION
+        HARVEST
+
+        OPERATIONAL_UNIT ||..o{ AGRICULTURAL_WORK : hosts
+        FIELD_WORK_TYPE ||..o{ AGRICULTURAL_WORK : classifies
+        AGRICULTURAL_WORK ||--o{ WORK_INPUT_APPLICATION : has_application
+        PRODUCT ||--o{ WORK_INPUT_APPLICATION : applied_as_input
+        WORK_INPUT_APPLICATION o|..o{ INVENTORY_MOVEMENT : consumes_through
+        OPERATIONAL_UNIT ||..o{ HARVEST : produces
+        PRODUCT ||..o{ HARVEST : yields
+        HARVEST o|..o| STOCK_OPERATION : originates
+
+        %% WorkInputApplication is an identifying domain association, not a direct Work <-> Product edge.
+        %% Campaign is derived through OperationalUnit and is not redundantly linked to AgriculturalWork.
+        %% Draft Harvest: 0 StockOperation; confirmed Harvest: exactly 1 logical StockOperation.
+        %% The optional Mermaid cardinality represents the lifecycle as a whole.
+    end
+
+    subgraph MACHINERY["MACHINERY / VEHICLES"]
+        OPERATIONAL_ASSET
+        METER_READING
+        ASSET_USAGE
+        MAINTENANCE_EVENT
+
+        OPERATIONAL_ASSET ||..o{ METER_READING : records
+        OPERATIONAL_ASSET ||..o{ ASSET_USAGE : is_used_in
+        OPERATIONAL_ASSET ||..o{ MAINTENANCE_EVENT : is_maintained_by
+
+        %% AssetUsage <-> operational target is intentionally unresolved; no allocation structure is implied.
+    end
+
+    subgraph LIVESTOCK["LIVESTOCK"]
+        LIVESTOCK_CATEGORY
+        HERD_GROUP
+        LIVESTOCK_EVENT
+
+        %% LivestockEvent relationships to Establishment, HerdGroup and LivestockCategory vary by event type
+        %% and remain unresolved pending the approved granularity/effects model.
+    end
+
+    subgraph COMMERCIAL["GRAIN / COMMERCIAL"]
+        CONTRACT
+        OPERATIONAL_COUNTERPARTY
+        CONTRACT_CPE_ALLOCATION
+        CPE
+        CERTIFICATE
+        SETTLEMENT
+        FREIGHT
+
+        PRODUCT o|..o{ CONTRACT : commits
+        CAMPAIGN o|..o{ CONTRACT : contextualizes
+        OPERATIONAL_COUNTERPARTY o|..o{ CONTRACT : participates_in
+        CONTRACT ||--o{ CONTRACT_CPE_ALLOCATION : allocates
+        CPE ||--o{ CONTRACT_CPE_ALLOCATION : is_allocated
+
+        %% ContractCpeAllocation is an explicit identifying, history-preserving domain association.
+        %% Contract and CPE have independent existence; this does not encode document chronology.
+        %% Product, Campaign and OperationalCounterparty are optional while Contract is draft
+        %% and mandatory exactly-one when Contract is confirmed.
+        %% CPE legal authority: ARCA. Settlement fiscal authority: Finnegans.
+        %% Local UUID identity remains Agro Ops structural identity; external implementation IDs are not shown.
+    end
+
+    subgraph COSTS["COSTS / RESULTS"]
+        COST_RECORD
+        COST_ALLOCATION
+        INTERNAL_RATE
+        PRODUCTIVE_RESULT
+
+        COST_RECORD ||--o{ COST_ALLOCATION : allocates
+        INTERNAL_RATE o|..o{ COST_ALLOCATION : may_value
+        INTERNAL_RATE o|..o{ PRODUCTIVE_RESULT : may_value
+
+        %% CostAllocation is an identifying, history-preserving association.
+        %% Its operational target is generic/conceptual and remains undrawn rather than made physical.
+        %% InternalRate is a management valuation criterion, not accounting.
+        %% ProductiveResult is derived/reproducible.
+    end
+
+    subgraph RECONCILIATION["RECONCILIATION / ALERTS"]
+        RECONCILIATION_RUN
+        RECONCILIATION_DIFFERENCE
+        ALERT
+
+        RECONCILIATION_RUN ||--o{ RECONCILIATION_DIFFERENCE : finds
+        USER o|..o{ ALERT : resolves
+
+        %% ReconciliationDifference is conceptually identifying to its run and compared subject.
+        %% ReconciliationDifference <-> Alert aggregation/deduplication cardinality remains unresolved.
+    end
+
+    %% ==================================================
+    %% UNRESOLVED RELATIONSHIPS
+    %% Source: conceptual-model.md §10 and §20
+    %% ==================================================
+    %% Etapa 2:
+    %% - Document <-> StoredObject exact cardinality and identifying semantics
+    %% - DocumentLink <-> generic business record target representation
+    %% - Local entity <-> ExternalReference generic target representation
+    %% - Business change <-> OutboxEvent generic source representation
+    %% Etapa 3:
+    %% - Campaign <-> Establishment
+    %% - BasePlot <-> OperationalUnit
+    %% - OperationalUnitUse simultaneity and confirmation obligatoriness
+    %% Etapa 4-7:
+    %% - Product <-> UnitOfMeasure cardinality/conversions
+    %% - StockOperation <-> source Document/Event
+    %% - AssetUsage <-> operational target
+    %% - LivestockEvent <-> Establishment/HerdGroup/LivestockCategory effects
+    %% Etapa 8-9:
+    %% - CPE <-> Establishment/Campaign/OperationalUnit
+    %% - CPE/Certificate <-> StockOperation/InventoryMovement
+    %% - CPE <-> Certificate; Contract <-> Certificate
+    %% - Settlement <-> Contract/CPE/Certificate
+    %% - CPE <-> Freight
+    %% Etapa 12-13:
+    %% - CostAllocation <-> operational target
+    %% - ReconciliationDifference <-> Alert
