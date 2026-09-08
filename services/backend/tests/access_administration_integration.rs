@@ -26,6 +26,16 @@ impl ExternalIdentityAdmin for MockExternalAdmin {
     ) -> Result<ExternalAuthUser, ExternalIdentityAdminError> {
         self.result.clone()
     }
+
+    async fn correos_electronicos_por_sujeto(
+        &self,
+        subjects: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, String>, ExternalIdentityAdminError> {
+        Ok(subjects
+            .iter()
+            .map(|subject| (*subject, format!("{subject}@example.com")))
+            .collect())
+    }
 }
 
 async fn database() -> PgPool {
@@ -193,6 +203,55 @@ fn successful_external_admin(subject: Uuid) -> Arc<MockExternalAdmin> {
     Arc::new(MockExternalAdmin {
         result: Ok(ExternalAuthUser { subject }),
     })
+}
+
+#[tokio::test]
+async fn administrative_user_list_includes_current_supabase_email_for_duplicate_names() {
+    let fixture = admin_fixture().await;
+    let second_subject = Uuid::new_v4();
+    let second_user: Uuid = sqlx::query_scalar(
+        "INSERT INTO public.usuarios (organizacion_id, nombre_completo) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(fixture.organization_id)
+    .bind("Administrador de prueba")
+    .fetch_one(&fixture.db)
+    .await
+    .expect("second user must insert");
+    sqlx::query(
+        "INSERT INTO public.identidades_autenticacion_externas (usuario_id, proveedor, sujeto_proveedor) VALUES ($1, 'supabase', $2)",
+    )
+    .bind(second_user)
+    .bind(second_subject)
+    .execute(&fixture.db)
+    .await
+    .expect("second Supabase identity must insert");
+
+    let users = access_administration::list_users(
+        &fixture.db,
+        successful_external_admin(Uuid::new_v4()).as_ref(),
+        &fixture.context,
+    )
+    .await
+    .expect("administrative user list must load");
+
+    let duplicate_names: Vec<_> = users
+        .usuarios
+        .iter()
+        .filter(|user| user.nombre_completo == "Administrador de prueba")
+        .collect();
+    assert_eq!(duplicate_names.len(), 2);
+    assert_ne!(
+        duplicate_names[0].correo_electronico,
+        duplicate_names[1].correo_electronico
+    );
+    let response = serde_json::to_value(&users).expect("user response must serialize");
+    assert!(
+        response["usuarios"]
+            .as_array()
+            .expect("users must be an array")
+            .iter()
+            .all(|user| user.get("correo_electronico").is_some())
+    );
 }
 
 #[tokio::test]
@@ -365,6 +424,7 @@ async fn posting_an_existing_same_organization_subject_conflicts_without_mutatio
     .expect("the initially unlinked subject must be provisioned");
     access_administration::update_user(
         &fixture.db,
+        successful_external_admin(Uuid::new_v4()).as_ref(),
         &fixture.context,
         first.id,
         &UpdateUserRequest {
@@ -482,6 +542,7 @@ async fn disabling_user_and_changing_roles_affect_the_next_authorization_request
 
     access_administration::update_user(
         &fixture.db,
+        successful_external_admin(Uuid::new_v4()).as_ref(),
         &fixture.context,
         user.id,
         &UpdateUserRequest {
@@ -508,6 +569,7 @@ async fn disabling_user_and_changing_roles_affect_the_next_authorization_request
 
     access_administration::update_user(
         &fixture.db,
+        successful_external_admin(Uuid::new_v4()).as_ref(),
         &fixture.context,
         user.id,
         &UpdateUserRequest {
@@ -569,6 +631,7 @@ async fn sole_administrator_cannot_be_disabled() {
 
     let error = access_administration::update_user(
         &fixture.db,
+        successful_external_admin(Uuid::new_v4()).as_ref(),
         &fixture.context,
         fixture.administrator_user_id,
         &UpdateUserRequest {
@@ -596,6 +659,7 @@ async fn sole_administrator_cannot_remove_their_last_administrative_role() {
 
     let error = access_administration::update_user(
         &fixture.db,
+        successful_external_admin(Uuid::new_v4()).as_ref(),
         &fixture.context,
         fixture.administrator_user_id,
         &UpdateUserRequest {
@@ -696,15 +760,19 @@ async fn concurrent_independent_removals_leave_one_effective_administrator() {
         activo: None,
         roles_ids: Some(vec![]),
     };
+    let first_external = successful_external_admin(Uuid::new_v4());
+    let second_external = successful_external_admin(Uuid::new_v4());
     let (first_result, second_result) = tokio::join!(
         access_administration::update_user(
             &fixture.db,
+            first_external.as_ref(),
             &fixture.context,
             fixture.administrator_user_id,
             &first_request,
         ),
         access_administration::update_user(
             &fixture.db,
+            second_external.as_ref(),
             &fixture.context,
             second.id,
             &second_request,
@@ -735,6 +803,7 @@ async fn administrative_reductions_succeed_when_another_administrator_remains() 
 
     access_administration::update_user(
         &fixture.db,
+        successful_external_admin(Uuid::new_v4()).as_ref(),
         &fixture.context,
         second.id,
         &UpdateUserRequest {
@@ -801,6 +870,7 @@ async fn finite_current_grants_are_shortened_and_synchronization_remains_idempot
     for _ in 0..2 {
         access_administration::update_user(
             &fixture.db,
+            successful_external_admin(Uuid::new_v4()).as_ref(),
             &fixture.context,
             user.id,
             &UpdateUserRequest {
@@ -865,6 +935,7 @@ async fn finite_current_grants_are_shortened_and_synchronization_remains_idempot
     for _ in 0..2 {
         access_administration::update_user(
             &fixture.db,
+            successful_external_admin(Uuid::new_v4()).as_ref(),
             &fixture.context,
             user.id,
             &UpdateUserRequest {

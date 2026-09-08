@@ -392,7 +392,12 @@ async fn configuration_users(
     )
     .await?;
     Ok(Json(
-        access_administration::list_users(&state.db, &context).await?,
+        access_administration::list_users(
+            &state.db,
+            state.external_identity_admin.as_ref(),
+            &context,
+        )
+        .await?,
     ))
 }
 
@@ -430,7 +435,14 @@ async fn configuration_update_user(
     )
     .await?;
     Ok(Json(
-        access_administration::update_user(&state.db, &context, user_id, &request).await?,
+        access_administration::update_user(
+            &state.db,
+            state.external_identity_admin.as_ref(),
+            &context,
+            user_id,
+            &request,
+        )
+        .await?,
     ))
 }
 
@@ -714,6 +726,19 @@ mod tests {
             Ok(supabase_admin::ExternalAuthUser {
                 subject: self.subject,
             })
+        }
+
+        async fn correos_electronicos_por_sujeto(
+            &self,
+            subjects: &[Uuid],
+        ) -> Result<
+            std::collections::HashMap<Uuid, String>,
+            supabase_admin::ExternalIdentityAdminError,
+        > {
+            Ok(subjects
+                .iter()
+                .map(|subject| (*subject, format!("{subject}@example.com")))
+                .collect())
         }
     }
 

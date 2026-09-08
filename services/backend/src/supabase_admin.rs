@@ -1,4 +1,4 @@
-use std::{fmt, time::Duration};
+use std::{collections::HashMap, fmt, time::Duration};
 
 use async_trait::async_trait;
 use reqwest::{Client, StatusCode, Url, header::HeaderValue};
@@ -29,6 +29,11 @@ pub trait ExternalIdentityAdmin: Send + Sync {
         email: &str,
         full_name: &str,
     ) -> Result<ExternalAuthUser, ExternalIdentityAdminError>;
+
+    async fn correos_electronicos_por_sujeto(
+        &self,
+        subjects: &[Uuid],
+    ) -> Result<HashMap<Uuid, String>, ExternalIdentityAdminError>;
 }
 
 pub struct SupabaseIdentityAdmin {
@@ -122,6 +127,54 @@ impl SupabaseIdentityAdmin {
             }
             page += 1;
         }
+    }
+
+    async fn fetch_correos_electronicos_por_sujeto(
+        &self,
+        subjects: &[Uuid],
+    ) -> Result<HashMap<Uuid, String>, ExternalIdentityAdminError> {
+        let subjects: std::collections::HashSet<Uuid> = subjects.iter().copied().collect();
+        let mut page = 1usize;
+        let mut emails = HashMap::new();
+
+        while emails.len() < subjects.len() {
+            let response = self
+                .client
+                .get(self.users_endpoint.clone())
+                .header("apikey", self.secret_key.clone())
+                .query(&[("page", page), ("per_page", USERS_PER_PAGE)])
+                .send()
+                .await
+                .map_err(|_| ExternalIdentityAdminError::Unavailable)?;
+            if !response.status().is_success() {
+                return Err(ExternalIdentityAdminError::Unavailable);
+            }
+            let users = response
+                .json::<SupabaseUsersResponse>()
+                .await
+                .map_err(|_| ExternalIdentityAdminError::Unavailable)?
+                .users;
+            for user in &users {
+                let subject = Uuid::parse_str(&user.id)
+                    .map_err(|_| ExternalIdentityAdminError::Unavailable)?;
+                if subjects.contains(&subject) {
+                    let email = user
+                        .email
+                        .as_ref()
+                        .filter(|email| !email.is_empty())
+                        .ok_or(ExternalIdentityAdminError::Unavailable)?;
+                    emails.insert(subject, email.clone());
+                }
+            }
+            if users.len() < USERS_PER_PAGE {
+                break;
+            }
+            page += 1;
+        }
+
+        (emails.len() == subjects.len())
+            .then_some(emails)
+            .ok_or(ExternalIdentityAdminError::Unavailable)
     }
 
     async fn invite(
@@ -237,6 +290,13 @@ impl ExternalIdentityAdmin for SupabaseIdentityAdmin {
             Err(error) => Err(error),
         }
     }
+
+    async fn correos_electronicos_por_sujeto(
+        &self,
+        subjects: &[Uuid],
+    ) -> Result<HashMap<Uuid, String>, ExternalIdentityAdminError> {
+        self.fetch_correos_electronicos_por_sujeto(subjects).await
+    }
 }
 
 #[derive(Debug)]
@@ -249,6 +309,13 @@ impl ExternalIdentityAdmin for UnavailableExternalIdentityAdmin {
         _email: &str,
         _full_name: &str,
     ) -> Result<ExternalAuthUser, ExternalIdentityAdminError> {
+        Err(ExternalIdentityAdminError::Unavailable)
+    }
+
+    async fn correos_electronicos_por_sujeto(
+        &self,
+        _subjects: &[Uuid],
+    ) -> Result<HashMap<Uuid, String>, ExternalIdentityAdminError> {
         Err(ExternalIdentityAdminError::Unavailable)
     }
 }

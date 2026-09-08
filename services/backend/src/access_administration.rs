@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
@@ -9,7 +11,14 @@ use crate::{
     supabase_admin::{ExternalIdentityAdmin, ExternalIdentityAdminError},
 };
 
-type UserWithCurrentRoleRow = (Uuid, String, bool, Option<Uuid>, Option<String>);
+type UserWithCurrentRoleRow = (
+    Uuid,
+    String,
+    bool,
+    Option<Uuid>,
+    Option<Uuid>,
+    Option<String>,
+);
 type RoleWithCurrentPermissionRow = (Uuid, String, Option<String>, bool, Option<String>);
 
 #[derive(Clone, Debug, Serialize)]
@@ -22,6 +31,7 @@ pub struct RoleReference {
 pub struct UserSummary {
     pub id: Uuid,
     pub nombre_completo: String,
+    pub correo_electronico: String,
     pub activo: bool,
     pub roles: Vec<RoleReference>,
 }
@@ -95,19 +105,26 @@ pub enum AccessAdministrationError {
 
 pub async fn list_users(
     db: &PgPool,
+    external_admin: &dyn ExternalIdentityAdmin,
     context: &AuthorizationContext,
 ) -> Result<UsersResponse, AccessAdministrationError> {
-    list_users_for_organization(db, context.organization_id).await
+    list_users_for_organization(db, external_admin, context.organization_id).await
 }
 
 async fn list_users_for_organization(
     db: &PgPool,
+    external_admin: &dyn ExternalIdentityAdmin,
     organization_id: Uuid,
 ) -> Result<UsersResponse, AccessAdministrationError> {
     let rows: Vec<UserWithCurrentRoleRow> = sqlx::query_as(
         r#"
-        SELECT usuario.id, usuario.nombre_completo, usuario.activo, rol.id, rol.nombre
+        SELECT usuario.id, usuario.nombre_completo, usuario.activo,
+               identidad.sujeto_proveedor, rol.id, rol.nombre
         FROM public.usuarios AS usuario
+        LEFT JOIN public.identidades_autenticacion_externas AS identidad
+          ON identidad.usuario_id = usuario.id
+         AND identidad.proveedor = $2
+         AND tstzrange(identidad.vinculada_en, identidad.desvinculada_en, '[)') @> statement_timestamp()
         LEFT JOIN public.usuarios_roles AS usuario_rol
           ON usuario_rol.usuario_id = usuario.id
          AND tstzrange(usuario_rol.vigente_desde, usuario_rol.vigente_hasta, '[)') @> statement_timestamp()
@@ -120,16 +137,24 @@ async fn list_users_for_organization(
         "#,
     )
     .bind(organization_id)
+    .bind(SUPABASE_PROVIDER)
     .fetch_all(db)
     .await
     .map_err(|_| AccessAdministrationError::DatabaseUnavailable)?;
 
+    let subjects: Vec<Uuid> = rows.iter().filter_map(|row| row.3).collect();
+    let correos = external_admin
+        .correos_electronicos_por_sujeto(&subjects)
+        .await
+        .map_err(map_external_error)?;
+
     let mut users: Vec<UserSummary> = Vec::new();
-    for (id, nombre_completo, activo, role_id, role_name) in rows {
+    for (id, nombre_completo, activo, subject, role_id, role_name) in rows {
         if users.last().is_none_or(|user| user.id != id) {
             users.push(UserSummary {
                 id,
                 nombre_completo,
+                correo_electronico: correo_electronico_actual(&correos, subject)?,
                 activo,
                 roles: Vec::new(),
             });
@@ -273,11 +298,12 @@ pub async fn create_or_enable_user(
         .commit()
         .await
         .map_err(|_| AccessAdministrationError::DatabaseUnavailable)?;
-    load_user(db, context.organization_id, user_id).await
+    load_user(db, external_admin, context.organization_id, user_id).await
 }
 
 pub async fn update_user(
     db: &PgPool,
+    external_admin: &dyn ExternalIdentityAdmin,
     context: &AuthorizationContext,
     user_id: Uuid,
     request: &UpdateUserRequest,
@@ -344,7 +370,7 @@ pub async fn update_user(
         .commit()
         .await
         .map_err(|_| AccessAdministrationError::DatabaseUnavailable)?;
-    load_user(db, context.organization_id, user_id).await
+    load_user(db, external_admin, context.organization_id, user_id).await
 }
 
 pub async fn create_role(
@@ -505,6 +531,16 @@ fn map_external_error(error: ExternalIdentityAdminError) -> AccessAdministration
         ExternalIdentityAdminError::AmbiguousIdentity => AccessAdministrationError::Conflict,
         ExternalIdentityAdminError::Unavailable => AccessAdministrationError::ExternalUnavailable,
     }
+}
+
+fn correo_electronico_actual(
+    correos: &HashMap<Uuid, String>,
+    subject: Option<Uuid>,
+) -> Result<String, AccessAdministrationError> {
+    subject
+        .and_then(|subject| correos.get(&subject))
+        .cloned()
+        .ok_or(AccessAdministrationError::ExternalUnavailable)
 }
 
 fn map_write_error(error: sqlx::Error) -> AccessAdministrationError {
@@ -693,10 +729,11 @@ async fn ensure_organization_has_effective_administrator(
 
 async fn load_user(
     db: &PgPool,
+    external_admin: &dyn ExternalIdentityAdmin,
     organization_id: Uuid,
     user_id: Uuid,
 ) -> Result<UserSummary, AccessAdministrationError> {
-    list_users_for_organization(db, organization_id)
+    list_users_for_organization(db, external_admin, organization_id)
         .await?
         .usuarios
         .into_iter()

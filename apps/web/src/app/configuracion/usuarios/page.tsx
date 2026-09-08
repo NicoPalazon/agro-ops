@@ -54,6 +54,8 @@ export default async function UsersPage() {
               <div>
                 <span className={styles.label}>Nombre</span>
                 <strong>{user.nombre_completo}</strong>
+                <span className={styles.label}>Correo electrÃ³nico</span>
+                <span>{user.correo_electronico}</span>
               </div>
               <span className={user.activo ? styles.active : styles.inactive}>
                 {user.activo ? "Habilitado" : "Deshabilitado"}

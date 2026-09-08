@@ -34,6 +34,7 @@ describe("administración normal de accesos", () => {
     mocks.loadUsers.mockResolvedValue([
       {
         id: "user-id",
+        correo_electronico: "ana@example.com",
         nombre_completo: "Ana Pérez",
         activo: true,
         roles: [{ id: "role-id", nombre: "Encargado" }],
@@ -50,8 +51,35 @@ describe("administración normal de accesos", () => {
     expect(markup).toContain("Roles asignados");
     expect(markup).toContain("Ana Pérez");
     expect(markup).toContain("Encargado");
+    expect(markup).toContain("ana@example.com");
     expect(markup).toContain("Deshabilitar");
     expect(markup).toContain("Guardar");
+  });
+
+  it("distinguishes users with the same full name by their email address", async () => {
+    mocks.loadUsers.mockResolvedValue([
+      {
+        id: "user-one-id",
+        nombre_completo: "Alex Romero",
+        correo_electronico: "alex.operaciones@example.com",
+        activo: true,
+        roles: [],
+      },
+      {
+        id: "user-two-id",
+        nombre_completo: "Alex Romero",
+        correo_electronico: "alex.administracion@example.com",
+        activo: false,
+        roles: [],
+      },
+    ]);
+
+    const markup = renderToStaticMarkup(await UsersPage());
+
+    expect(markup).toContain("alex.operaciones@example.com");
+    expect(markup).toContain("alex.administracion@example.com");
+    expect(markup).not.toContain("user-one-id");
+    expect(markup).not.toContain("user-two-id");
   });
 
   it("renders role creation, activation and canonical permission membership", async () => {
