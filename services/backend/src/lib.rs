@@ -19,6 +19,7 @@ pub mod authorization;
 pub mod config;
 pub mod service_heartbeats;
 pub mod shutdown;
+pub mod stage2_access_provisioning;
 pub mod telemetry;
 pub mod worker;
 
