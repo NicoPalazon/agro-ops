@@ -15,12 +15,12 @@ use utoipa::{Modify, OpenApi, ToSchema};
 use uuid::Uuid;
 
 pub mod access_administration;
+pub mod access_provisioning;
 pub mod auth;
 pub mod authorization;
 pub mod config;
 pub mod service_heartbeats;
 pub mod shutdown;
-pub mod stage2_access_provisioning;
 pub mod supabase_admin;
 pub mod telemetry;
 pub mod worker;
@@ -650,7 +650,7 @@ async fn openapi_json(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<utoipa::openapi::OpenApi>, RequestAccessError> {
-    authenticate_request(&state, &headers).await?;
+    resolve_request_context(&state, &headers).await?;
     Ok(Json(ApiDoc::openapi()))
 }
 
@@ -669,6 +669,10 @@ mod tests {
     use super::*;
 
     struct TestAccessTokenVerifier;
+
+    struct FixedExternalIdentityAdmin {
+        subject: Uuid,
+    }
 
     const VALID_TOKEN_PREFIX: &str = "valid-test-access-token:";
 
@@ -695,6 +699,20 @@ mod tests {
                 .ok_or(auth::VerifyAccessTokenError::Invalid)?;
             Ok(auth::AuthenticatedUser {
                 id: subject.to_owned(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl supabase_admin::ExternalIdentityAdmin for FixedExternalIdentityAdmin {
+        async fn resolve_or_invite(
+            &self,
+            _email: &str,
+            _full_name: &str,
+        ) -> Result<supabase_admin::ExternalAuthUser, supabase_admin::ExternalIdentityAdminError>
+        {
+            Ok(supabase_admin::ExternalAuthUser {
+                subject: self.subject,
             })
         }
     }
@@ -737,6 +755,15 @@ mod tests {
     }
 
     async fn provision_internal_console_access(db: &PgPool, subject: Uuid) {
+        provision_internal_access(
+            db,
+            subject,
+            authorization::permission_codes::CONSOLA_TECNICA_VER,
+        )
+        .await;
+    }
+
+    async fn provision_internal_access(db: &PgPool, subject: Uuid, permission_code: &str) {
         let organization_id = Uuid::new_v4();
         let user_id = Uuid::new_v4();
         let role_id = Uuid::new_v4();
@@ -777,12 +804,13 @@ mod tests {
             .execute(db)
             .await
             .expect("test role assignment must insert");
-        sqlx::query("INSERT INTO public.roles_permisos (id, rol_id, permiso_id, vigente_desde) SELECT $1, $2, id, CURRENT_TIMESTAMP - INTERVAL '1 minute' FROM public.permisos WHERE codigo = 'consola_tecnica:ver'")
+        sqlx::query("INSERT INTO public.roles_permisos (id, rol_id, permiso_id, vigente_desde) SELECT $1, $2, id, CURRENT_TIMESTAMP - INTERVAL '1 minute' FROM public.permisos WHERE codigo = $3")
             .bind(permission_grant_id)
             .bind(role_id)
+            .bind(permission_code)
             .execute(db)
             .await
-            .expect("test technical-console permission grant must insert");
+            .expect("test permission grant must insert");
     }
 
     async fn response_body(response: axum::response::Response) -> String {
@@ -844,11 +872,14 @@ mod tests {
 
     #[tokio::test]
     async fn openapi_document_exposes_current_api_contract_and_request_identity_headers() {
-        let response = app(unavailable_state())
+        let state = available_state().await;
+        let subject = Uuid::new_v4();
+        provision_internal_console_access(&state.db, subject).await;
+        let response = app(state)
             .oneshot(
                 Request::builder()
                     .uri("/openapi.json")
-                    .header("authorization", "Bearer valid-test-access-token")
+                    .header("authorization", format!("Bearer {}", valid_token(subject)))
                     .header("x-correlation-id", "openapi-test-correlation")
                     .body(Body::empty())
                     .expect("OpenAPI request must be valid"),
@@ -1329,6 +1360,105 @@ mod tests {
             .expect("OpenAPI request must succeed");
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn openapi_rejects_a_valid_unprovisioned_supabase_identity() {
+        let state = available_state().await;
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/openapi.json")
+                    .header(
+                        "authorization",
+                        format!("Bearer {}", valid_token(Uuid::new_v4())),
+                    )
+                    .body(Body::empty())
+                    .expect("OpenAPI request must be valid"),
+            )
+            .await
+            .expect("OpenAPI request must succeed");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn openapi_reports_authorization_dependency_unavailability() {
+        let response = app(unavailable_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/openapi.json")
+                    .header("authorization", "Bearer valid-test-access-token")
+                    .body(Body::empty())
+                    .expect("OpenAPI request must be valid"),
+            )
+            .await
+            .expect("OpenAPI request must succeed");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn posting_an_already_linked_subject_returns_conflict_without_mutation() {
+        let mut state = available_state().await;
+        let subject = Uuid::new_v4();
+        provision_internal_access(
+            &state.db,
+            subject,
+            authorization::permission_codes::CONFIGURACION_ADMINISTRAR,
+        )
+        .await;
+        state.external_identity_admin = Arc::new(FixedExternalIdentityAdmin { subject });
+        let existing: (Uuid, String) = sqlx::query_as(
+            r#"
+            SELECT rol.id, usuario.nombre_completo
+            FROM public.identidades_autenticacion_externas AS identidad
+            JOIN public.usuarios AS usuario ON usuario.id = identidad.usuario_id
+            JOIN public.usuarios_roles AS usuario_rol ON usuario_rol.usuario_id = usuario.id
+            JOIN public.roles AS rol ON rol.id = usuario_rol.rol_id
+            WHERE identidad.proveedor = 'supabase'
+              AND identidad.sujeto_proveedor = $1
+              AND tstzrange(usuario_rol.vigente_desde, usuario_rol.vigente_hasta, '[)')
+                  @> statement_timestamp()
+            "#,
+        )
+        .bind(subject)
+        .fetch_one(&state.db)
+        .await
+        .expect("existing linked administrator must be queryable");
+        let body = serde_json::json!({
+            "correo_electronico": "linked@example.com",
+            "nombre_completo": "Mutated through POST",
+            "roles_ids": [existing.0],
+        });
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/configuracion/usuarios")
+                    .header("authorization", format!("Bearer {}", valid_token(subject)))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("configuration user request must be valid"),
+            )
+            .await
+            .expect("configuration user request must complete");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let stored_name: String = sqlx::query_scalar(
+            r#"
+            SELECT usuario.nombre_completo
+            FROM public.identidades_autenticacion_externas AS identidad
+            JOIN public.usuarios AS usuario ON usuario.id = identidad.usuario_id
+            WHERE identidad.proveedor = 'supabase' AND identidad.sujeto_proveedor = $1
+            "#,
+        )
+        .bind(subject)
+        .fetch_one(&state.db)
+        .await
+        .expect("linked user must remain queryable");
+        assert_eq!(stored_name, existing.1);
     }
 
     #[tokio::test]

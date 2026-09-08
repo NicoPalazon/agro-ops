@@ -44,6 +44,26 @@ jobs:
       - name: Install Railway CLI
         run: npm install --global @railway/cli@5.47.2
 
+      - name: Validate Railway staging API runtime configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          variables_json_path="$(mktemp)"
+          trap 'rm -f "${variables_json_path}"' EXIT
+
+          if ! railway variable list --json \
+            --project "${RAILWAY_PROJECT_ID}" \
+            --environment staging \
+            --service "${RAILWAY_API_SERVICE_ID}" \
+            >"${variables_json_path}" 2>/dev/null
+          then
+            echo "Unable to query Railway staging API configuration." >&2
+            exit 1
+          fi
+
+          bash scripts/validate-railway-api-config.sh "${variables_json_path}"
+
       - name: Deploy API
         run: >-
           railway up services/backend --path-as-root --ci

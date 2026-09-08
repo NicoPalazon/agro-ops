@@ -69,6 +69,9 @@ jobs:
 
       - name: Test staging runtime smoke helpers
         run: bash scripts/staging-runtime-smoke-test.sh
+
+      - name: Test Railway API configuration preflight
+        run: bash scripts/validate-railway-api-config-test.sh
   backend-rust:
     name: Backend Rust
     runs-on: ubuntu-latest

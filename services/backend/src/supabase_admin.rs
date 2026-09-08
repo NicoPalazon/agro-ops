@@ -89,7 +89,6 @@ impl SupabaseIdentityAdmin {
                 .client
                 .get(self.users_endpoint.clone())
                 .header("apikey", self.secret_key.clone())
-                .header("authorization", bearer_value(&self.secret_key)?)
                 .query(&[("page", page), ("per_page", USERS_PER_PAGE)])
                 .send()
                 .await
@@ -134,7 +133,6 @@ impl SupabaseIdentityAdmin {
             .client
             .post(self.invite_endpoint.clone())
             .header("apikey", self.secret_key.clone())
-            .header("authorization", bearer_value(&self.secret_key)?)
             .query(&[("redirect_to", self.invite_redirect_url.as_str())])
             .json(&InviteRequest {
                 email,
@@ -166,16 +164,6 @@ impl SupabaseIdentityAdmin {
 
         Err(ExternalIdentityAdminError::Unavailable)
     }
-}
-
-fn bearer_value(key: &HeaderValue) -> Result<HeaderValue, ExternalIdentityAdminError> {
-    let value = key
-        .to_str()
-        .map_err(|_| ExternalIdentityAdminError::Unavailable)?;
-    let mut bearer = HeaderValue::from_str(&format!("Bearer {value}"))
-        .map_err(|_| ExternalIdentityAdminError::Unavailable)?;
-    bearer.set_sensitive(true);
-    Ok(bearer)
 }
 
 impl fmt::Debug for SupabaseIdentityAdmin {
@@ -267,23 +255,219 @@ impl ExternalIdentityAdmin for UnavailableExternalIdentityAdmin {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::{
+        Router,
+        extract::State,
+        http::{HeaderMap, StatusCode, header},
+        routing::{get, post},
+    };
+    use tokio::{net::TcpListener, task::JoinHandle};
+
     use super::*;
     use crate::config::AppEnvironment;
 
+    const SECRET_KEY: &str = "sb_secret_admin_transport_test_3d9a2f";
+
+    #[derive(Debug)]
+    struct CapturedAdminRequest {
+        endpoint: &'static str,
+        api_key_matches_secret: bool,
+        has_authorization: bool,
+    }
+
+    #[derive(Clone)]
+    struct MockSupabaseAdminState {
+        secret_key: HeaderValue,
+        users_response: String,
+        invite_response: String,
+        requests: Arc<Mutex<Vec<CapturedAdminRequest>>>,
+    }
+
+    struct MockSupabaseAdmin {
+        adapter: SupabaseIdentityAdmin,
+        requests: Arc<Mutex<Vec<CapturedAdminRequest>>>,
+        task: JoinHandle<()>,
+    }
+
+    impl Drop for MockSupabaseAdmin {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    fn capture_request(state: &MockSupabaseAdminState, endpoint: &'static str, headers: HeaderMap) {
+        state
+            .requests
+            .lock()
+            .expect("mock request lock must be available")
+            .push(CapturedAdminRequest {
+                endpoint,
+                api_key_matches_secret: headers
+                    .get("apikey")
+                    .is_some_and(|value| value == state.secret_key),
+                has_authorization: headers.contains_key(header::AUTHORIZATION),
+            });
+    }
+
+    async fn users(
+        State(state): State<MockSupabaseAdminState>,
+        headers: HeaderMap,
+    ) -> (StatusCode, [(header::HeaderName, &'static str); 1], String) {
+        capture_request(&state, "users", headers);
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            state.users_response,
+        )
+    }
+
+    async fn invite(
+        State(state): State<MockSupabaseAdminState>,
+        headers: HeaderMap,
+    ) -> (StatusCode, [(header::HeaderName, &'static str); 1], String) {
+        capture_request(&state, "invite", headers);
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            state.invite_response,
+        )
+    }
+
+    async fn mock_supabase_admin(
+        users_response: String,
+        invite_response: String,
+    ) -> MockSupabaseAdmin {
+        let secret_key = HeaderValue::from_static(SECRET_KEY);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let state = MockSupabaseAdminState {
+            secret_key,
+            users_response,
+            invite_response,
+            requests: Arc::clone(&requests),
+        };
+        let app = Router::new()
+            .route("/auth/v1/admin/users", get(users))
+            .route("/auth/v1/invite", post(invite))
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock Supabase listener must bind");
+        let address = listener
+            .local_addr()
+            .expect("mock Supabase listener must expose its address");
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let config = SupabaseAdminConfig::from_values(
+            AppEnvironment::Local,
+            format!("http://{address}"),
+            SECRET_KEY,
+            "http://127.0.0.1:3000/aceptar-invitacion",
+        )
+        .expect("mock Supabase configuration must be valid");
+        let client = Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .expect("mock admin client must build");
+
+        MockSupabaseAdmin {
+            adapter: SupabaseIdentityAdmin::with_client(&config, client)
+                .expect("mock admin adapter must build"),
+            requests,
+            task,
+        }
+    }
+
     #[test]
     fn privileged_credential_is_redacted_from_adapter_debug_output() {
-        let secret = "service-role-secret-that-must-never-leak";
         let config = SupabaseAdminConfig::from_values(
             AppEnvironment::Local,
             "http://127.0.0.1:54321",
-            secret,
+            SECRET_KEY,
             "http://127.0.0.1:3000/aceptar-invitacion",
         )
         .expect("test configuration must be valid");
         let adapter = SupabaseIdentityAdmin::new(&config).expect("adapter must build");
 
-        assert!(!format!("{adapter:?}").contains(secret));
-        assert!(!format!("{:?}", ExternalIdentityAdminError::Unavailable).contains(secret));
+        assert!(!format!("{adapter:?}").contains(SECRET_KEY));
+        assert!(!format!("{:?}", ExternalIdentityAdminError::Unavailable).contains(SECRET_KEY));
+    }
+
+    #[tokio::test]
+    async fn lookup_sends_opaque_admin_secret_only_in_apikey_header() {
+        let subject = Uuid::new_v4();
+        let mock = mock_supabase_admin(
+            format!(r#"{{"users":[{{"id":"{subject}","email":"user@example.com"}}]}}"#),
+            r#"{"id":"unused"}"#.to_owned(),
+        )
+        .await;
+
+        assert_eq!(
+            mock.adapter
+                .resolve_or_invite("user@example.com", "User Example")
+                .await,
+            Ok(ExternalAuthUser { subject })
+        );
+
+        let requests = mock
+            .requests
+            .lock()
+            .expect("mock request lock must be available");
+        assert_eq!(requests.len(), 1);
+        let lookup = &requests[0];
+        assert_eq!(lookup.endpoint, "users");
+        assert!(lookup.api_key_matches_secret);
+        assert!(!lookup.has_authorization);
+        assert!(!format!("{requests:?}").contains(SECRET_KEY));
+    }
+
+    #[tokio::test]
+    async fn invite_sends_opaque_admin_secret_only_in_apikey_header() {
+        let subject = Uuid::new_v4();
+        let mock = mock_supabase_admin(
+            r#"{"users":[]}"#.to_owned(),
+            format!(r#"{{"id":"{subject}"}}"#),
+        )
+        .await;
+
+        assert_eq!(
+            mock.adapter
+                .resolve_or_invite("new-user@example.com", "New User")
+                .await,
+            Ok(ExternalAuthUser { subject })
+        );
+
+        let requests = mock
+            .requests
+            .lock()
+            .expect("mock request lock must be available");
+        let invite = requests
+            .iter()
+            .find(|request| request.endpoint == "invite")
+            .expect("invite request must be captured");
+        assert!(invite.api_key_matches_secret);
+        assert!(!invite.has_authorization);
+        assert!(!format!("{requests:?}").contains(SECRET_KEY));
+    }
+
+    #[tokio::test]
+    async fn returned_admin_errors_do_not_expose_the_opaque_secret() {
+        let mock = mock_supabase_admin(
+            r#"{"users":[{"id":"not-a-uuid","email":"user@example.com"}]}"#.to_owned(),
+            r#"{"id":"unused"}"#.to_owned(),
+        )
+        .await;
+
+        let error = mock
+            .adapter
+            .resolve_or_invite("user@example.com", "User Example")
+            .await
+            .expect_err("an invalid Supabase subject must be unavailable");
+
+        assert_eq!(error, ExternalIdentityAdminError::Unavailable);
+        assert!(!format!("{error:?}").contains(SECRET_KEY));
     }
 
     #[test]

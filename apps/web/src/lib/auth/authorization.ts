@@ -32,10 +32,10 @@ export async function loadAuthorizationContext(
   accessToken: string | null,
 ): Promise<AuthorizationResult> {
   if (!accessToken) return { status: "unauthenticated" };
-  const baseUrl = apiBaseUrl();
-  if (!baseUrl) return { status: "unavailable" };
 
   try {
+    const baseUrl = apiBaseUrl();
+    if (!baseUrl) return { status: "unavailable" };
     const response = await fetch(new URL("/me", baseUrl), {
       cache: "no-store",
       headers: { authorization: `Bearer ${accessToken}` },
@@ -58,7 +58,13 @@ export async function requireCapability(
   permission: string,
   returnPath: string,
 ): Promise<AuthorizationContext> {
-  const result = await loadAuthorizationContext(await authenticatedAccessToken());
+  let accessToken: string | null;
+  try {
+    accessToken = await authenticatedAccessToken();
+  } catch {
+    redirect("/servicio-no-disponible");
+  }
+  const result = await loadAuthorizationContext(accessToken);
   if (result.status === "unauthenticated") {
     redirect(`/login?next=${encodeURIComponent(safeReturnPath(returnPath))}`);
   }

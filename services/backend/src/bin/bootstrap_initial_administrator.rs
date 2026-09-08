@@ -1,4 +1,4 @@
-use agro_ops_backend::stage2_access_provisioning::{
+use agro_ops_backend::access_provisioning::{
     ProvisionStage2AccessConfig, bootstrap_stage2_administrator,
 };
 use sqlx::postgres::PgPoolOptions;

@@ -3,6 +3,9 @@ use std::{env, fmt};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
+use crate::access_administration::{
+    lock_organization_administration, organization_has_effective_administrator,
+};
 use crate::authorization::{
     SUPABASE_PROVIDER,
     permission_codes::{CONFIGURACION_ADMINISTRAR, CONSOLA_TECNICA_VER},
@@ -174,6 +177,20 @@ pub async fn bootstrap_stage2_administrator(
 
     let organization_id =
         resolve_organization(&mut transaction, &request.organization_name).await?;
+    lock_organization_administration(&mut transaction, organization_id).await?;
+    if organization_has_effective_administrator(&mut transaction, organization_id).await?
+        && !is_current_initial_administrator(
+            &mut transaction,
+            organization_id,
+            request.supabase_subject,
+        )
+        .await?
+    {
+        return Err(ProvisionStage2AccessError::Operational(
+            "the organization already has an effective administrator; bootstrap refuses a different subject"
+                .to_owned(),
+        ));
+    }
     let user_id = resolve_user_and_identity(&mut transaction, organization_id, request).await?;
     let role_id = resolve_initial_admin_role(&mut transaction, organization_id).await?;
     let configuration_permission_id =
@@ -198,6 +215,53 @@ pub async fn bootstrap_stage2_administrator(
         role_name: INITIAL_ADMIN_ROLE_NAME,
         permission_codes: [CONFIGURACION_ADMINISTRAR, CONSOLA_TECNICA_VER],
     })
+}
+
+async fn is_current_initial_administrator(
+    transaction: &mut Transaction<'_, Postgres>,
+    organization_id: Uuid,
+    supabase_subject: Uuid,
+) -> Result<bool, ProvisionStage2AccessError> {
+    Ok(sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM public.identidades_autenticacion_externas AS identidad
+            JOIN public.usuarios AS usuario
+              ON usuario.id = identidad.usuario_id
+             AND usuario.organizacion_id = $1
+             AND usuario.activo
+            JOIN public.usuarios_roles AS usuario_rol
+              ON usuario_rol.usuario_id = usuario.id
+             AND tstzrange(usuario_rol.vigente_desde, usuario_rol.vigente_hasta, '[)')
+                 @> statement_timestamp()
+            JOIN public.roles AS rol
+              ON rol.id = usuario_rol.rol_id
+             AND rol.organizacion_id = usuario.organizacion_id
+             AND rol.nombre = $4
+             AND rol.activo
+            JOIN public.roles_permisos AS rol_permiso
+              ON rol_permiso.rol_id = rol.id
+             AND tstzrange(rol_permiso.vigente_desde, rol_permiso.vigente_hasta, '[)')
+                 @> statement_timestamp()
+            JOIN public.permisos AS permiso
+              ON permiso.id = rol_permiso.permiso_id
+             AND permiso.codigo = $3
+             AND permiso.activo
+            WHERE identidad.proveedor = $2
+              AND identidad.sujeto_proveedor = $5
+              AND tstzrange(identidad.vinculada_en, identidad.desvinculada_en, '[)')
+                  @> statement_timestamp()
+        )
+        "#,
+    )
+    .bind(organization_id)
+    .bind(SUPABASE_PROVIDER)
+    .bind(CONFIGURACION_ADMINISTRAR)
+    .bind(INITIAL_ADMIN_ROLE_NAME)
+    .bind(supabase_subject)
+    .fetch_one(&mut **transaction)
+    .await?)
 }
 
 async fn provision_in_transaction(

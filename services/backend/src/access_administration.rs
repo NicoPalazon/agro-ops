@@ -3,7 +3,9 @@ use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{
-    authorization::{AuthorizationContext, SUPABASE_PROVIDER},
+    authorization::{
+        AuthorizationContext, SUPABASE_PROVIDER, permission_codes::CONFIGURACION_ADMINISTRAR,
+    },
     supabase_admin::{ExternalIdentityAdmin, ExternalIdentityAdminError},
 };
 
@@ -230,14 +232,12 @@ pub async fn create_or_enable_user(
         .map_err(|_| AccessAdministrationError::DatabaseUnavailable)?;
     validate_roles(&mut transaction, context.organization_id, &roles).await?;
 
-    let existing: Option<(Uuid, Uuid, bool)> = sqlx::query_as(
+    let existing: Option<Uuid> = sqlx::query_scalar(
         r#"
-        SELECT usuario.id, usuario.organizacion_id,
-               tstzrange(identidad.vinculada_en, identidad.desvinculada_en, '[)') @> transaction_timestamp()
+        SELECT identidad.id
         FROM public.identidades_autenticacion_externas AS identidad
-        JOIN public.usuarios AS usuario ON usuario.id = identidad.usuario_id
         WHERE identidad.proveedor = $1 AND identidad.sujeto_proveedor = $2
-        FOR UPDATE OF identidad, usuario
+        FOR UPDATE
         "#,
     )
     .bind(SUPABASE_PROVIDER)
@@ -246,43 +246,27 @@ pub async fn create_or_enable_user(
     .await
     .map_err(|_| AccessAdministrationError::DatabaseUnavailable)?;
 
-    let user_id = match existing {
-        Some((_, organization_id, _)) if organization_id != context.organization_id => {
-            return Err(AccessAdministrationError::Conflict);
-        }
-        Some((_, _, false)) => return Err(AccessAdministrationError::Conflict),
-        Some((user_id, _, true)) => {
-            sqlx::query(
-                "UPDATE public.usuarios SET nombre_completo = $1, activo = TRUE WHERE id = $2",
-            )
-            .bind(full_name)
-            .bind(user_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|_| AccessAdministrationError::DatabaseUnavailable)?;
-            user_id
-        }
-        None => {
-            let user_id: Uuid = sqlx::query_scalar(
-                "INSERT INTO public.usuarios (organizacion_id, nombre_completo) VALUES ($1, $2) RETURNING id",
-            )
-            .bind(context.organization_id)
-            .bind(full_name)
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(|_| AccessAdministrationError::DatabaseUnavailable)?;
-            sqlx::query(
-                "INSERT INTO public.identidades_autenticacion_externas (usuario_id, proveedor, sujeto_proveedor) VALUES ($1, $2, $3)",
-            )
-            .bind(user_id)
-            .bind(SUPABASE_PROVIDER)
-            .bind(external_user.subject)
-            .execute(&mut *transaction)
-            .await
-            .map_err(map_write_error)?;
-            user_id
-        }
-    };
+    if existing.is_some() {
+        return Err(AccessAdministrationError::Conflict);
+    }
+
+    let user_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO public.usuarios (organizacion_id, nombre_completo) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(context.organization_id)
+    .bind(full_name)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| AccessAdministrationError::DatabaseUnavailable)?;
+    sqlx::query(
+        "INSERT INTO public.identidades_autenticacion_externas (usuario_id, proveedor, sujeto_proveedor) VALUES ($1, $2, $3)",
+    )
+    .bind(user_id)
+    .bind(SUPABASE_PROVIDER)
+    .bind(external_user.subject)
+    .execute(&mut *transaction)
+    .await
+    .map_err(map_write_error)?;
 
     synchronize_user_roles(&mut transaction, user_id, &roles).await?;
     transaction
@@ -312,6 +296,12 @@ pub async fn update_user(
         .begin()
         .await
         .map_err(|_| AccessAdministrationError::DatabaseUnavailable)?;
+    let may_reduce_administrators = request.activo == Some(false) || roles.is_some();
+    if may_reduce_administrators {
+        lock_organization_administration(&mut transaction, context.organization_id)
+            .await
+            .map_err(|_| AccessAdministrationError::DatabaseUnavailable)?;
+    }
 
     let user_exists: Option<Uuid> = sqlx::query_scalar(
         "SELECT id FROM public.usuarios WHERE id = $1 AND organizacion_id = $2 FOR UPDATE",
@@ -344,6 +334,10 @@ pub async fn update_user(
     if let Some(roles) = roles.as_ref() {
         validate_roles(&mut transaction, context.organization_id, roles).await?;
         synchronize_user_roles(&mut transaction, user_id, roles).await?;
+    }
+    if may_reduce_administrators {
+        ensure_organization_has_effective_administrator(&mut transaction, context.organization_id)
+            .await?;
     }
 
     transaction
@@ -414,6 +408,12 @@ pub async fn update_role(
         .begin()
         .await
         .map_err(|_| AccessAdministrationError::DatabaseUnavailable)?;
+    let may_reduce_administrators = request.activo == Some(false) || permissions.is_some();
+    if may_reduce_administrators {
+        lock_organization_administration(&mut transaction, context.organization_id)
+            .await
+            .map_err(|_| AccessAdministrationError::DatabaseUnavailable)?;
+    }
 
     let role_exists: Option<Uuid> = sqlx::query_scalar(
         "SELECT id FROM public.roles WHERE id = $1 AND organizacion_id = $2 FOR UPDATE",
@@ -454,6 +454,10 @@ pub async fn update_role(
     if let Some(permissions) = permissions.as_ref() {
         let permission_ids = validate_permissions(&mut transaction, permissions).await?;
         synchronize_role_permissions(&mut transaction, role_id, &permission_ids).await?;
+    }
+    if may_reduce_administrators {
+        ensure_organization_has_effective_administrator(&mut transaction, context.organization_id)
+            .await?;
     }
 
     transaction
@@ -554,7 +558,7 @@ async fn synchronize_user_roles(
     desired: &[Uuid],
 ) -> Result<(), AccessAdministrationError> {
     let current: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT rol_id FROM public.usuarios_roles WHERE usuario_id = $1 AND tstzrange(vigente_desde, vigente_hasta, '[)') @> transaction_timestamp() FOR UPDATE",
+        "SELECT rol_id FROM public.usuarios_roles WHERE usuario_id = $1 AND tstzrange(vigente_desde, vigente_hasta, '[)') @> statement_timestamp() FOR UPDATE",
     )
     .bind(user_id)
     .fetch_all(&mut **transaction)
@@ -562,7 +566,7 @@ async fn synchronize_user_roles(
     .map_err(|_| AccessAdministrationError::DatabaseUnavailable)?;
 
     sqlx::query(
-        "UPDATE public.usuarios_roles SET vigente_hasta = transaction_timestamp() WHERE usuario_id = $1 AND vigente_hasta IS NULL AND NOT (rol_id = ANY($2))",
+        "UPDATE public.usuarios_roles SET vigente_hasta = statement_timestamp() WHERE usuario_id = $1 AND tstzrange(vigente_desde, vigente_hasta, '[)') @> statement_timestamp() AND NOT (rol_id = ANY($2))",
     )
     .bind(user_id)
     .bind(desired)
@@ -587,7 +591,7 @@ async fn synchronize_role_permissions(
     desired: &[Uuid],
 ) -> Result<(), AccessAdministrationError> {
     let current: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT permiso_id FROM public.roles_permisos WHERE rol_id = $1 AND tstzrange(vigente_desde, vigente_hasta, '[)') @> transaction_timestamp() FOR UPDATE",
+        "SELECT permiso_id FROM public.roles_permisos WHERE rol_id = $1 AND tstzrange(vigente_desde, vigente_hasta, '[)') @> statement_timestamp() FOR UPDATE",
     )
     .bind(role_id)
     .fetch_all(&mut **transaction)
@@ -595,7 +599,7 @@ async fn synchronize_role_permissions(
     .map_err(|_| AccessAdministrationError::DatabaseUnavailable)?;
 
     sqlx::query(
-        "UPDATE public.roles_permisos SET vigente_hasta = transaction_timestamp() WHERE rol_id = $1 AND vigente_hasta IS NULL AND NOT (permiso_id = ANY($2))",
+        "UPDATE public.roles_permisos SET vigente_hasta = statement_timestamp() WHERE rol_id = $1 AND tstzrange(vigente_desde, vigente_hasta, '[)') @> statement_timestamp() AND NOT (permiso_id = ANY($2))",
     )
     .bind(role_id)
     .bind(desired)
@@ -615,6 +619,76 @@ async fn synchronize_role_permissions(
             .map_err(map_write_error)?;
     }
     Ok(())
+}
+
+pub(crate) async fn lock_organization_administration(
+    transaction: &mut Transaction<'_, Postgres>,
+    organization_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended('agro_ops:access-administration:' || $1::text, 0::bigint))",
+    )
+    .bind(organization_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+pub(crate) async fn organization_has_effective_administrator(
+    transaction: &mut Transaction<'_, Postgres>,
+    organization_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM public.usuarios AS usuario
+            JOIN public.organizaciones AS organizacion
+              ON organizacion.id = usuario.organizacion_id
+             AND organizacion.activa
+            JOIN public.identidades_autenticacion_externas AS identidad
+              ON identidad.usuario_id = usuario.id
+             AND identidad.proveedor = $3
+             AND tstzrange(identidad.vinculada_en, identidad.desvinculada_en, '[)')
+                 @> statement_timestamp()
+            JOIN public.usuarios_roles AS usuario_rol
+              ON usuario_rol.usuario_id = usuario.id
+             AND tstzrange(usuario_rol.vigente_desde, usuario_rol.vigente_hasta, '[)')
+                 @> statement_timestamp()
+            JOIN public.roles AS rol
+              ON rol.id = usuario_rol.rol_id
+             AND rol.organizacion_id = usuario.organizacion_id
+             AND rol.activo
+            JOIN public.roles_permisos AS rol_permiso
+              ON rol_permiso.rol_id = rol.id
+             AND tstzrange(rol_permiso.vigente_desde, rol_permiso.vigente_hasta, '[)')
+                 @> statement_timestamp()
+            JOIN public.permisos AS permiso
+              ON permiso.id = rol_permiso.permiso_id
+             AND permiso.activo
+             AND permiso.codigo = $2
+            WHERE usuario.organizacion_id = $1
+              AND usuario.activo
+        )
+        "#,
+    )
+    .bind(organization_id)
+    .bind(CONFIGURACION_ADMINISTRAR)
+    .bind(SUPABASE_PROVIDER)
+    .fetch_one(&mut **transaction)
+    .await
+}
+
+async fn ensure_organization_has_effective_administrator(
+    transaction: &mut Transaction<'_, Postgres>,
+    organization_id: Uuid,
+) -> Result<(), AccessAdministrationError> {
+    let remains = organization_has_effective_administrator(transaction, organization_id)
+        .await
+        .map_err(|_| AccessAdministrationError::DatabaseUnavailable)?;
+    remains
+        .then_some(())
+        .ok_or(AccessAdministrationError::Conflict)
 }
 
 async fn load_user(

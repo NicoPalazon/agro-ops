@@ -69,3 +69,11 @@ Therefore, no repository or ancestor AGENTS.md files apply, and there is no prec
 6. Codex version
 
 - @openai/codex version: 0.153.1
+
+7. File naming
+
+- Source and test filenames must describe responsibility, domain, capability, or behavior.
+- Do not use roadmap stage or slice numbers as the primary filename.
+- Keep stage and slice identifiers in planning, PR, and commit context rather than implementation names.
+- Migration filenames retain their timestamp plus descriptive action naming.
+- Preserve externally relevant compatibility names when renaming them would break an established operational interface.

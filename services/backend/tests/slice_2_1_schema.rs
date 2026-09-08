@@ -252,6 +252,52 @@ async fn materializes_relations_catalog_and_approved_primary_key_names() {
 }
 
 #[tokio::test]
+async fn authorization_protection_trigger_functions_use_a_fixed_catalog_search_path() {
+    let _guard = database_test_lock().lock().await;
+    let db = test_pool().await;
+    let search_paths: Vec<(String, String)> = sqlx::query_as(
+        "SELECT p.proname, array_to_string(p.proconfig, ',') FROM pg_proc AS p INNER JOIN pg_namespace AS n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname IN ('impedir_cambio_organizacion_usuario', 'impedir_cambio_organizacion_rol', 'impedir_cambio_codigo_permiso', 'proteger_historia_identidad_auth', 'proteger_historia_usuario_rol', 'proteger_historia_rol_permiso', 'impedir_truncate_historia_autorizacion') ORDER BY p.proname",
+    )
+    .fetch_all(&db)
+    .await
+    .expect("authorization protection function settings must be queryable");
+
+    assert_eq!(
+        search_paths,
+        vec![
+            (
+                "impedir_cambio_codigo_permiso".to_owned(),
+                "search_path=pg_catalog".to_owned()
+            ),
+            (
+                "impedir_cambio_organizacion_rol".to_owned(),
+                "search_path=pg_catalog".to_owned()
+            ),
+            (
+                "impedir_cambio_organizacion_usuario".to_owned(),
+                "search_path=pg_catalog".to_owned()
+            ),
+            (
+                "impedir_truncate_historia_autorizacion".to_owned(),
+                "search_path=pg_catalog".to_owned()
+            ),
+            (
+                "proteger_historia_identidad_auth".to_owned(),
+                "search_path=pg_catalog".to_owned()
+            ),
+            (
+                "proteger_historia_rol_permiso".to_owned(),
+                "search_path=pg_catalog".to_owned()
+            ),
+            (
+                "proteger_historia_usuario_rol".to_owned(),
+                "search_path=pg_catalog".to_owned()
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn enforces_foreign_keys_organization_consistency_and_restrictive_deletion() {
     let _guard = database_test_lock().lock().await;
     let db = test_pool().await;

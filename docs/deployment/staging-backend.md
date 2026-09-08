@@ -29,6 +29,11 @@ for user lookup and invitation. Keep it only in the Railway API service: never
 add it to Vercel, `NEXT_PUBLIC_*`, browser code, logs, or API responses.
 Add the exact `SUPABASE_INVITE_REDIRECT_URL` to the Supabase Auth allowed redirect
 URLs. The value is not secret, but it belongs to backend runtime configuration.
+Both variables are API-only: never configure them as `NEXT_PUBLIC_*` or expose
+them to Vercel or browser code. Before deployment, the staging workflow queries
+the Railway API service and performs a presence-only preflight for required API
+runtime variables. It reports only missing variable names and never creates,
+rotates, or prints secret values.
 `/openapi.json` is authenticated: retrieve it with an enabled user's Supabase
 access token in `Authorization: Bearer <token>`. The publishable key is not a
 privileged key and is used only for ordinary access-token verification.
@@ -44,4 +49,4 @@ privileged key and is used only for ordinary access-token verification.
 7. Add the deployed staging frontend HTTPS origin, with no trailing path, as the GitHub `staging` environment variable `STAGING_WEB_BASE_URL`. The `Staging auth browser E2E` workflow reuses `STAGING_SMOKE_EMAIL` and `STAGING_SMOKE_PASSWORD` for the same enabled dedicated Supabase Auth smoke-test user and tests the deployed frontend through its login UI.
 8. Run `Deploy staging backend`, then run `Staging runtime smoke` and `Staging auth browser E2E`.
 
-The deployment workflow uploads `services/backend` as the build root and waits for both Railway deployments to succeed. It assumes the account-specific service commands, variables, healthcheck, and API domain have already been configured; it does not create or guess provider resources.
+The deployment workflow uploads `services/backend` as the build root and waits for both Railway deployments to succeed. It first checks that the Railway API service has its required non-empty runtime variables, including `SUPABASE_SECRET_KEY` and `SUPABASE_INVITE_REDIRECT_URL`. The check does not create, rotate, or reveal variables. It assumes the account-specific service commands, variables, healthcheck, and API domain have already been configured; it does not create or guess provider resources.

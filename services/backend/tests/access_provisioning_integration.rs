@@ -1,13 +1,13 @@
 use std::sync::OnceLock;
 
 use agro_ops_backend::{
+    access_provisioning::{
+        INITIAL_ADMIN_ROLE_NAME, ProvisionStage2AccessError, ProvisionStage2AccessRequest,
+        TECHNICAL_ROLE_NAME, bootstrap_stage2_administrator, provision_stage2_access,
+    },
     authorization::{
         self,
         permission_codes::{CONFIGURACION_ADMINISTRAR, CONSOLA_TECNICA_VER},
-    },
-    stage2_access_provisioning::{
-        INITIAL_ADMIN_ROLE_NAME, ProvisionStage2AccessError, ProvisionStage2AccessRequest,
-        TECHNICAL_ROLE_NAME, bootstrap_stage2_administrator, provision_stage2_access,
     },
 };
 use sqlx::{PgPool, postgres::PgPoolOptions};
@@ -47,6 +47,96 @@ async fn explicit_first_administrator_bootstrap_grants_required_capabilities() {
     .await
     .expect("technical role count must be queryable");
     assert_eq!(technical_role_count, 0);
+}
+
+#[tokio::test]
+async fn identical_first_administrator_bootstrap_is_idempotent_without_new_history() {
+    let _guard = database_test_lock().lock().await;
+    let db = test_pool().await;
+    let request = request("initial-administrator-idempotent");
+    let first = bootstrap_stage2_administrator(&db, &request)
+        .await
+        .expect("first administrator bootstrap must succeed");
+    let role_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM public.roles WHERE organizacion_id = $1 AND nombre = $2",
+    )
+    .bind(first.organization_id)
+    .bind(INITIAL_ADMIN_ROLE_NAME)
+    .fetch_one(&db)
+    .await
+    .expect("initial administrator role must exist");
+    let before: (i64, i64, i64, i64) = sqlx::query_as(
+        r#"
+        SELECT
+            (SELECT COUNT(*)::bigint FROM public.usuarios WHERE organizacion_id = $1),
+            (SELECT COUNT(*)::bigint FROM public.identidades_autenticacion_externas WHERE usuario_id = $2),
+            (SELECT COUNT(*)::bigint FROM public.usuarios_roles WHERE usuario_id = $2),
+            (SELECT COUNT(*)::bigint FROM public.roles_permisos WHERE rol_id = $3)
+        "#,
+    )
+    .bind(first.organization_id)
+    .bind(first.user_id)
+    .bind(role_id)
+    .fetch_one(&db)
+    .await
+    .expect("bootstrap history counts must be queryable");
+
+    let second = bootstrap_stage2_administrator(&db, &request)
+        .await
+        .expect("identical administrator bootstrap must be safe");
+    let after: (i64, i64, i64, i64) = sqlx::query_as(
+        r#"
+        SELECT
+            (SELECT COUNT(*)::bigint FROM public.usuarios WHERE organizacion_id = $1),
+            (SELECT COUNT(*)::bigint FROM public.identidades_autenticacion_externas WHERE usuario_id = $2),
+            (SELECT COUNT(*)::bigint FROM public.usuarios_roles WHERE usuario_id = $2),
+            (SELECT COUNT(*)::bigint FROM public.roles_permisos WHERE rol_id = $3)
+        "#,
+    )
+    .bind(second.organization_id)
+    .bind(second.user_id)
+    .bind(role_id)
+    .fetch_one(&db)
+    .await
+    .expect("bootstrap history counts must remain queryable");
+
+    assert_eq!(second, first);
+    assert_eq!(after, before);
+}
+
+#[tokio::test]
+async fn bootstrap_rejects_a_second_distinct_administrator_subject() {
+    let _guard = database_test_lock().lock().await;
+    let db = test_pool().await;
+    let first_request = request("initial-administrator-exclusive");
+    let first = bootstrap_stage2_administrator(&db, &first_request)
+        .await
+        .expect("first administrator bootstrap must succeed");
+    let second_subject = Uuid::new_v4();
+    let second_request = ProvisionStage2AccessRequest {
+        supabase_subject: second_subject,
+        organization_name: first_request.organization_name.clone(),
+        user_full_name: "Second bootstrap subject".to_owned(),
+    };
+
+    let error = bootstrap_stage2_administrator(&db, &second_request)
+        .await
+        .expect_err("bootstrap must reject a different subject after an administrator exists");
+    assert!(operational_message(error).contains("already has an effective administrator"));
+    assert_eq!(
+        table_count(&db, "usuarios", "organizacion_id", first.organization_id).await,
+        1
+    );
+    assert_eq!(
+        table_count(
+            &db,
+            "identidades_autenticacion_externas",
+            "sujeto_proveedor",
+            second_subject,
+        )
+        .await,
+        0
+    );
 }
 
 async fn test_pool() -> PgPool {

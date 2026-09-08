@@ -79,6 +79,28 @@ describe("web capability gate", () => {
     );
   });
 
+  it("maps Supabase session failures to Servicio no disponible", async () => {
+    mocks.accessToken.mockRejectedValue(new Error("session dependency unavailable"));
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(requireCapability("consola_tecnica:ver", "/internal")).rejects.toThrow(
+      "redirect:/servicio-no-disponible",
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("maps API configuration failures to Servicio no disponible", async () => {
+    vi.stubEnv("API_BASE_URL", "not a valid URL");
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(requireCapability("consola_tecnica:ver", "/internal")).rejects.toThrow(
+      "redirect:/servicio-no-disponible",
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("keeps the login redirect when no session exists", async () => {
     mocks.accessToken.mockResolvedValue(null);
 

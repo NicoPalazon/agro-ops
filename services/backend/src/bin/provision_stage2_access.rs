@@ -1,6 +1,4 @@
-use agro_ops_backend::stage2_access_provisioning::{
-    ProvisionStage2AccessConfig, provision_stage2_access,
-};
+use agro_ops_backend::access_provisioning::{ProvisionStage2AccessConfig, provision_stage2_access};
 use sqlx::postgres::PgPoolOptions;
 
 #[tokio::main]
