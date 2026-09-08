@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Instant};
 
 use axum::{
     Json, Router,
-    extract::{MatchedPath, Request, State},
+    extract::{MatchedPath, Path, Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -14,12 +14,14 @@ use tracing::{Instrument, error, info, info_span, warn};
 use utoipa::{Modify, OpenApi, ToSchema};
 use uuid::Uuid;
 
+pub mod access_administration;
 pub mod auth;
 pub mod authorization;
 pub mod config;
 pub mod service_heartbeats;
 pub mod shutdown;
 pub mod stage2_access_provisioning;
+pub mod supabase_admin;
 pub mod telemetry;
 pub mod worker;
 
@@ -29,6 +31,7 @@ use service_heartbeats::{ServiceStatus, ServiceStatusReport, WORKER_SERVICE_NAME
 pub struct AppState {
     pub db: PgPool,
     pub auth: Arc<dyn auth::AccessTokenVerifier>,
+    pub external_identity_admin: Arc<dyn supabase_admin::ExternalIdentityAdmin>,
 }
 
 const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
@@ -54,6 +57,19 @@ struct SystemStatusResponse {
     version: VersionResponse,
 }
 
+#[derive(Serialize, ToSchema)]
+struct MeResponse {
+    usuario_id: String,
+    organizacion_id: String,
+    permisos: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ApiErrorResponse {
+    error: &'static str,
+    mensaje: &'static str,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum RequestAccessError {
     AuthenticationFailed,
@@ -75,6 +91,71 @@ impl IntoResponse for RequestAccessError {
             Self::AuthorizationInvariantViolation => StatusCode::INTERNAL_SERVER_ERROR,
         }
         .into_response()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AdministrationRequestError {
+    Access(RequestAccessError),
+    Administration(access_administration::AccessAdministrationError),
+}
+
+impl From<RequestAccessError> for AdministrationRequestError {
+    fn from(error: RequestAccessError) -> Self {
+        Self::Access(error)
+    }
+}
+
+impl From<access_administration::AccessAdministrationError> for AdministrationRequestError {
+    fn from(error: access_administration::AccessAdministrationError) -> Self {
+        Self::Administration(error)
+    }
+}
+
+impl IntoResponse for AdministrationRequestError {
+    fn into_response(self) -> Response {
+        use access_administration::AccessAdministrationError as Error;
+
+        match self {
+            Self::Access(error) => error.into_response(),
+            Self::Administration(error) => {
+                let (status, code, message) = match error {
+                    Error::InvalidInput => (
+                        StatusCode::BAD_REQUEST,
+                        "entrada_invalida",
+                        "Los datos enviados no son válidos.",
+                    ),
+                    Error::NotFound => (
+                        StatusCode::NOT_FOUND,
+                        "no_encontrado",
+                        "El recurso solicitado no existe.",
+                    ),
+                    Error::Conflict => (
+                        StatusCode::CONFLICT,
+                        "conflicto_acceso",
+                        "La operación entra en conflicto con el estado de acceso actual.",
+                    ),
+                    Error::ExternalRejected => (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "supabase_rechazo_operacion",
+                        "Supabase no pudo crear o resolver ese usuario.",
+                    ),
+                    Error::ExternalUnavailable | Error::DatabaseUnavailable => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "administracion_no_disponible",
+                        "La administración de accesos no está disponible temporalmente.",
+                    ),
+                };
+                (
+                    status,
+                    Json(ApiErrorResponse {
+                        error: code,
+                        mensaje: message,
+                    }),
+                )
+                    .into_response()
+            }
+        }
     }
 }
 
@@ -105,8 +186,8 @@ impl Modify for SupabaseBearerSecurity {
         version = env!("CARGO_PKG_VERSION"),
         description = "HTTP contract for Agro Ops backend health and system status endpoints."
     ),
-    paths(health, ready, version, internal_worker_status, internal_system_status),
-    components(schemas(StatusResponse, VersionResponse, SystemStatusResponse, ServiceStatus, ServiceStatusReport)),
+    paths(health, ready, version, me, internal_worker_status, internal_system_status),
+    components(schemas(StatusResponse, VersionResponse, MeResponse, SystemStatusResponse, ServiceStatus, ServiceStatusReport)),
     modifiers(&SupabaseBearerSecurity)
 )]
 struct ApiDoc;
@@ -116,6 +197,23 @@ pub fn app(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/version", get(version))
+        .route("/me", get(me))
+        .route(
+            "/configuracion/usuarios",
+            get(configuration_users).post(configuration_create_user),
+        )
+        .route(
+            "/configuracion/usuarios/{user_id}",
+            axum::routing::patch(configuration_update_user),
+        )
+        .route(
+            "/configuracion/roles",
+            get(configuration_roles).post(configuration_create_role),
+        )
+        .route(
+            "/configuracion/roles/{role_id}",
+            axum::routing::patch(configuration_update_role),
+        )
         .route("/internal/worker/status", get(internal_worker_status))
         .route("/internal/system-status", get(internal_system_status))
         .route("/openapi.json", get(openapi_json))
@@ -260,6 +358,129 @@ async fn version() -> Json<VersionResponse> {
     })
 }
 
+#[utoipa::path(
+    get,
+    path = "/me",
+    security(("supabaseBearer" = [])),
+    responses(
+        (status = 200, description = "Current Agro Ops authorization context.", body = MeResponse),
+        (status = 401, description = "A valid Supabase user access token is required."),
+        (status = 403, description = "The Supabase identity is not enabled in Agro Ops."),
+        (status = 503, description = "Authentication or authorization is unavailable.")
+    )
+)]
+async fn me(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<MeResponse>, RequestAccessError> {
+    let context = resolve_request_context(&state, &headers).await?;
+    Ok(Json(MeResponse {
+        usuario_id: context.user_id.to_string(),
+        organizacion_id: context.organization_id.to_string(),
+        permisos: context.permission_codes().iter().cloned().collect(),
+    }))
+}
+
+async fn configuration_users(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<access_administration::UsersResponse>, AdministrationRequestError> {
+    let context = authorize_request(
+        &state,
+        &headers,
+        authorization::permission_codes::CONFIGURACION_ADMINISTRAR,
+    )
+    .await?;
+    Ok(Json(
+        access_administration::list_users(&state.db, &context).await?,
+    ))
+}
+
+async fn configuration_create_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<access_administration::CreateUserRequest>,
+) -> Result<(StatusCode, Json<access_administration::UserSummary>), AdministrationRequestError> {
+    let context = authorize_request(
+        &state,
+        &headers,
+        authorization::permission_codes::CONFIGURACION_ADMINISTRAR,
+    )
+    .await?;
+    let user = access_administration::create_or_enable_user(
+        &state.db,
+        state.external_identity_admin.as_ref(),
+        &context,
+        &request,
+    )
+    .await?;
+    Ok((StatusCode::CREATED, Json(user)))
+}
+
+async fn configuration_update_user(
+    State(state): State<AppState>,
+    Path(user_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(request): Json<access_administration::UpdateUserRequest>,
+) -> Result<Json<access_administration::UserSummary>, AdministrationRequestError> {
+    let context = authorize_request(
+        &state,
+        &headers,
+        authorization::permission_codes::CONFIGURACION_ADMINISTRAR,
+    )
+    .await?;
+    Ok(Json(
+        access_administration::update_user(&state.db, &context, user_id, &request).await?,
+    ))
+}
+
+async fn configuration_roles(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<access_administration::RolesResponse>, AdministrationRequestError> {
+    let context = authorize_request(
+        &state,
+        &headers,
+        authorization::permission_codes::CONFIGURACION_ADMINISTRAR,
+    )
+    .await?;
+    Ok(Json(
+        access_administration::list_roles(&state.db, &context).await?,
+    ))
+}
+
+async fn configuration_create_role(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<access_administration::CreateRoleRequest>,
+) -> Result<(StatusCode, Json<access_administration::RoleSummary>), AdministrationRequestError> {
+    let context = authorize_request(
+        &state,
+        &headers,
+        authorization::permission_codes::CONFIGURACION_ADMINISTRAR,
+    )
+    .await?;
+    let role = access_administration::create_role(&state.db, &context, &request).await?;
+    Ok((StatusCode::CREATED, Json(role)))
+}
+
+async fn configuration_update_role(
+    State(state): State<AppState>,
+    Path(role_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(request): Json<access_administration::UpdateRoleRequest>,
+) -> Result<Json<access_administration::RoleSummary>, AdministrationRequestError> {
+    let context = authorize_request(
+        &state,
+        &headers,
+        authorization::permission_codes::CONFIGURACION_ADMINISTRAR,
+    )
+    .await?;
+    Ok(Json(
+        access_administration::update_role(&state.db, &context, role_id, &request).await?,
+    ))
+}
+
 /// Reports the persisted worker heartbeat status.
 #[utoipa::path(
     get,
@@ -388,6 +609,19 @@ async fn authorize_request(
     headers: &HeaderMap,
     required_permission: &'static str,
 ) -> Result<authorization::AuthorizationContext, RequestAccessError> {
+    let context = resolve_request_context(state, headers).await?;
+
+    context
+        .require_permission(required_permission)
+        .map_err(|_| RequestAccessError::PermissionDenied)?;
+
+    Ok(context)
+}
+
+async fn resolve_request_context(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<authorization::AuthorizationContext, RequestAccessError> {
     let authenticated_user = authenticate_request(state, headers).await?;
     let supabase_subject = Uuid::parse_str(&authenticated_user.id).map_err(|_| {
         warn!("Supabase authentication returned a non-UUID subject");
@@ -409,10 +643,6 @@ async fn authorize_request(
             }
         })?;
 
-    context
-        .require_permission(required_permission)
-        .map_err(|_| RequestAccessError::PermissionDenied)?;
-
     Ok(context)
 }
 
@@ -431,7 +661,7 @@ mod tests {
     use async_trait::async_trait;
     use axum::{
         body::{Body, to_bytes},
-        http::{Request, StatusCode},
+        http::{Method, Request, StatusCode},
     };
     use sqlx::postgres::PgPoolOptions;
     use tower::ServiceExt;
@@ -489,6 +719,7 @@ mod tests {
         AppState {
             db,
             auth: test_auth(),
+            external_identity_admin: Arc::new(supabase_admin::UnavailableExternalIdentityAdmin),
         }
     }
 
@@ -501,6 +732,7 @@ mod tests {
         AppState {
             db,
             auth: test_auth(),
+            external_identity_admin: Arc::new(supabase_admin::UnavailableExternalIdentityAdmin),
         }
     }
 
@@ -653,6 +885,7 @@ mod tests {
             "/health",
             "/ready",
             "/version",
+            "/me",
             "/internal/worker/status",
             "/internal/system-status",
         ] {
@@ -673,6 +906,10 @@ mod tests {
         assert_eq!(
             document["components"]["securitySchemes"]["supabaseBearer"]["bearerFormat"],
             "JWT"
+        );
+        assert_eq!(
+            document["paths"]["/me"]["get"]["security"][0]["supabaseBearer"],
+            serde_json::json!([])
         );
         assert_eq!(
             document["paths"]["/internal/worker/status"]["get"]["security"][0]["supabaseBearer"],
@@ -1092,5 +1329,135 @@ mod tests {
             .expect("OpenAPI request must succeed");
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn me_requires_a_valid_access_token() {
+        let response = app(unavailable_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/me")
+                    .body(Body::empty())
+                    .expect("me request must be valid"),
+            )
+            .await
+            .expect("me request must succeed");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn me_rejects_a_valid_unprovisioned_supabase_identity() {
+        let state = available_state().await;
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/me")
+                    .header(
+                        "authorization",
+                        format!("Bearer {}", valid_token(Uuid::new_v4())),
+                    )
+                    .body(Body::empty())
+                    .expect("me request must be valid"),
+            )
+            .await
+            .expect("me request must succeed");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn me_returns_the_enabled_users_deduplicated_authorization_context() {
+        let state = available_state().await;
+        let subject = Uuid::new_v4();
+        provision_internal_console_access(&state.db, subject).await;
+
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/me")
+                    .header("authorization", format!("Bearer {}", valid_token(subject)))
+                    .body(Body::empty())
+                    .expect("me request must be valid"),
+            )
+            .await
+            .expect("me request must succeed");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_body(response).await)
+            .expect("me response must be valid JSON");
+        assert!(Uuid::parse_str(body["usuario_id"].as_str().expect("user id")).is_ok());
+        assert!(
+            Uuid::parse_str(body["organizacion_id"].as_str().expect("organization id")).is_ok()
+        );
+        assert_eq!(
+            body["permisos"],
+            serde_json::json!([authorization::permission_codes::CONSOLA_TECNICA_VER])
+        );
+        assert!(body.get("roles").is_none());
+        assert!(body.get("sujeto_proveedor").is_none());
+    }
+
+    #[tokio::test]
+    async fn me_reports_authorization_dependency_unavailability() {
+        let response = app(unavailable_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/me")
+                    .header("authorization", "Bearer valid-test-access-token")
+                    .body(Body::empty())
+                    .expect("me request must be valid"),
+            )
+            .await
+            .expect("me request must succeed");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn access_management_requires_configuration_administration_permission() {
+        let state = available_state().await;
+        let subject = Uuid::new_v4();
+        provision_internal_console_access(&state.db, subject).await;
+
+        for (method, uri, body) in [
+            (Method::GET, "/configuracion/usuarios", ""),
+            (
+                Method::POST,
+                "/configuracion/usuarios",
+                r#"{"correo_electronico":"x@example.com","nombre_completo":"X","roles_ids":[]}"#,
+            ),
+            (
+                Method::PATCH,
+                "/configuracion/usuarios/00000000-0000-0000-0000-000000000001",
+                r#"{"activo":false}"#,
+            ),
+            (Method::GET, "/configuracion/roles", ""),
+            (
+                Method::POST,
+                "/configuracion/roles",
+                r#"{"nombre":"X","permisos":[]}"#,
+            ),
+            (
+                Method::PATCH,
+                "/configuracion/roles/00000000-0000-0000-0000-000000000001",
+                r#"{"activo":false}"#,
+            ),
+        ] {
+            let response = app(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .method(method)
+                        .header("authorization", format!("Bearer {}", valid_token(subject)))
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .expect("configuration request must be valid"),
+                )
+                .await
+                .expect("configuration request must succeed");
+
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
     }
 }

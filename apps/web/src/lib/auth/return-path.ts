@@ -3,8 +3,13 @@ const APPLICATION_ORIGIN = "http://agro-ops.local";
 
 type ReturnPathValue = string | string[] | null | undefined;
 
-function isInternalPathname(pathname: string): boolean {
-  return pathname === "/internal" || pathname.startsWith("/internal/");
+function isPrivatePathname(pathname: string): boolean {
+  return (
+    pathname === "/internal" ||
+    pathname.startsWith("/internal/") ||
+    pathname === "/configuracion" ||
+    pathname.startsWith("/configuracion/")
+  );
 }
 
 /**
@@ -13,7 +18,7 @@ function isInternalPathname(pathname: string): boolean {
  * the application.
  */
 export function safeReturnPath(value: ReturnPathValue): string {
-  if (typeof value !== "string" || !isInternalPathname(value.split(/[?#]/, 1)[0])) {
+  if (typeof value !== "string" || !isPrivatePathname(value.split(/[?#]/, 1)[0])) {
     return DEFAULT_RETURN_PATH;
   }
 
@@ -21,7 +26,7 @@ export function safeReturnPath(value: ReturnPathValue): string {
     const url = new URL(value, APPLICATION_ORIGIN);
 
     return url.origin === APPLICATION_ORIGIN &&
-      isInternalPathname(url.pathname) &&
+      isPrivatePathname(url.pathname) &&
       !/%2f|%5c/i.test(url.pathname)
       ? `${url.pathname}${url.search}`
       : DEFAULT_RETURN_PATH;

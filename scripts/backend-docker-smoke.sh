@@ -345,6 +345,8 @@ docker run --detach --name "${api_container}" --network "${network_name}" \
     --env "PORT=${api_port}" \
     --env "SUPABASE_URL=${supabase_auth_url}" \
     --env "SUPABASE_PUBLISHABLE_KEY=${smoke_publishable_key}" \
+    --env "SUPABASE_SECRET_KEY=smoke-secret-key" \
+    --env "SUPABASE_INVITE_REDIRECT_URL=http://localhost:3000/aceptar-invitacion" \
     "${image_tag}" api >/dev/null
 containers+=("${api_container}")
 

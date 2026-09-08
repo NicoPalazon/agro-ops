@@ -12,6 +12,12 @@ describe("safeReturnPath", () => {
     );
   });
 
+  it("preserves configuration descendants", () => {
+    expect(safeReturnPath("/configuracion/usuarios?estado=activo")).toBe(
+      "/configuracion/usuarios?estado=activo",
+    );
+  });
+
   it.each([
     "/internalized",
     "https://attacker.example/internal/system-status",

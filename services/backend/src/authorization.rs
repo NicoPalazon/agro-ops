@@ -6,6 +6,7 @@ use uuid::Uuid;
 pub const SUPABASE_PROVIDER: &str = "supabase";
 
 pub mod permission_codes {
+    pub const CONFIGURACION_ADMINISTRAR: &str = "configuracion:administrar";
     pub const CONSOLA_TECNICA_VER: &str = "consola_tecnica:ver";
 }
 

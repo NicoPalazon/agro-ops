@@ -41,6 +41,10 @@ pub enum ConfigError {
     InvalidSupabaseUrl,
     InsecureSupabaseUrl,
     MissingSupabasePublishableKey,
+    MissingSupabaseSecretKey,
+    MissingSupabaseInviteRedirectUrl,
+    InvalidSupabaseInviteRedirectUrl,
+    InsecureSupabaseInviteRedirectUrl,
 }
 
 impl fmt::Display for ConfigError {
@@ -69,6 +73,18 @@ impl fmt::Display for ConfigError {
             ),
             Self::MissingSupabasePublishableKey => formatter.write_str(
                 "invalid configuration: SUPABASE_PUBLISHABLE_KEY is required for API authentication",
+            ),
+            Self::MissingSupabaseSecretKey => formatter.write_str(
+                "invalid configuration: SUPABASE_SECRET_KEY is required for access administration",
+            ),
+            Self::MissingSupabaseInviteRedirectUrl => formatter.write_str(
+                "invalid configuration: SUPABASE_INVITE_REDIRECT_URL is required for access administration",
+            ),
+            Self::InvalidSupabaseInviteRedirectUrl => formatter.write_str(
+                "invalid configuration: SUPABASE_INVITE_REDIRECT_URL must be an absolute HTTP(S) URL",
+            ),
+            Self::InsecureSupabaseInviteRedirectUrl => formatter.write_str(
+                "invalid configuration: SUPABASE_INVITE_REDIRECT_URL must use HTTPS outside local development",
             ),
         }
     }
@@ -140,6 +156,98 @@ impl fmt::Debug for SupabaseAuthConfig {
             .debug_struct("SupabaseAuthConfig")
             .field("url", &self.url)
             .field("publishable_key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub struct SupabaseAdminConfig {
+    url: String,
+    secret_key: String,
+    invite_redirect_url: String,
+}
+
+impl SupabaseAdminConfig {
+    pub fn from_env(app_environment: AppEnvironment) -> Result<Self, ConfigError> {
+        Self::from_lookup(app_environment, |key| std::env::var(key).ok())
+    }
+
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub fn secret_key(&self) -> &str {
+        &self.secret_key
+    }
+
+    pub fn invite_redirect_url(&self) -> &str {
+        &self.invite_redirect_url
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_values(
+        app_environment: AppEnvironment,
+        url: impl Into<String>,
+        secret_key: impl Into<String>,
+        invite_redirect_url: impl Into<String>,
+    ) -> Result<Self, ConfigError> {
+        let url = url.into();
+        let secret_key = secret_key.into();
+        let invite_redirect_url = invite_redirect_url.into();
+        Self::from_lookup(app_environment, |key| match key {
+            "SUPABASE_URL" => Some(url.clone()),
+            "SUPABASE_SECRET_KEY" => Some(secret_key.clone()),
+            "SUPABASE_INVITE_REDIRECT_URL" => Some(invite_redirect_url.clone()),
+            _ => None,
+        })
+    }
+
+    fn from_lookup<F>(app_environment: AppEnvironment, lookup: F) -> Result<Self, ConfigError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let url = lookup("SUPABASE_URL")
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(ConfigError::MissingSupabaseUrl)?;
+        let parsed_url = reqwest::Url::parse(&url).map_err(|_| ConfigError::InvalidSupabaseUrl)?;
+        if !matches!(parsed_url.scheme(), "http" | "https") || parsed_url.host().is_none() {
+            return Err(ConfigError::InvalidSupabaseUrl);
+        }
+        if app_environment != AppEnvironment::Local && parsed_url.scheme() != "https" {
+            return Err(ConfigError::InsecureSupabaseUrl);
+        }
+        let secret_key = lookup("SUPABASE_SECRET_KEY")
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(ConfigError::MissingSupabaseSecretKey)?;
+        let invite_redirect_url = lookup("SUPABASE_INVITE_REDIRECT_URL")
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(ConfigError::MissingSupabaseInviteRedirectUrl)?;
+        let parsed_redirect_url = reqwest::Url::parse(&invite_redirect_url)
+            .map_err(|_| ConfigError::InvalidSupabaseInviteRedirectUrl)?;
+        if !matches!(parsed_redirect_url.scheme(), "http" | "https")
+            || parsed_redirect_url.host().is_none()
+        {
+            return Err(ConfigError::InvalidSupabaseInviteRedirectUrl);
+        }
+        if app_environment != AppEnvironment::Local && parsed_redirect_url.scheme() != "https" {
+            return Err(ConfigError::InsecureSupabaseInviteRedirectUrl);
+        }
+
+        Ok(Self {
+            url,
+            secret_key,
+            invite_redirect_url,
+        })
+    }
+}
+
+impl fmt::Debug for SupabaseAdminConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SupabaseAdminConfig")
+            .field("url", &self.url)
+            .field("secret_key", &"[REDACTED]")
+            .field("invite_redirect_url", &self.invite_redirect_url)
             .finish()
     }
 }
@@ -416,5 +524,59 @@ mod tests {
             .expect_err("non-local Supabase authentication must use HTTPS");
             assert_eq!(error, ConfigError::InsecureSupabaseUrl);
         }
+    }
+
+    #[test]
+    fn reads_and_redacts_supabase_admin_configuration() {
+        let secret = "service-role-secret-value";
+        let config = SupabaseAdminConfig::from_values(
+            AppEnvironment::Staging,
+            "https://project.supabase.co",
+            secret,
+            "https://web.example.com/aceptar-invitacion",
+        )
+        .expect("Supabase Admin configuration must be valid");
+
+        assert_eq!(config.url(), "https://project.supabase.co");
+        assert_eq!(config.secret_key(), secret);
+        assert_eq!(
+            config.invite_redirect_url(),
+            "https://web.example.com/aceptar-invitacion"
+        );
+        assert!(!format!("{config:?}").contains(secret));
+    }
+
+    #[test]
+    fn requires_supabase_secret_key_for_access_administration() {
+        let error = SupabaseAdminConfig::from_lookup(AppEnvironment::Local, |key| match key {
+            "SUPABASE_URL" => Some("http://127.0.0.1:54321".to_owned()),
+            "SUPABASE_INVITE_REDIRECT_URL" => {
+                Some("http://127.0.0.1:3000/aceptar-invitacion".to_owned())
+            }
+            _ => None,
+        })
+        .expect_err("Supabase Admin credentials must be required by the API");
+
+        assert_eq!(error, ConfigError::MissingSupabaseSecretKey);
+    }
+
+    #[test]
+    fn requires_and_validates_the_invitation_redirect_url() {
+        let missing = SupabaseAdminConfig::from_lookup(AppEnvironment::Local, |key| match key {
+            "SUPABASE_URL" => Some("http://127.0.0.1:54321".to_owned()),
+            "SUPABASE_SECRET_KEY" => Some("secret".to_owned()),
+            _ => None,
+        })
+        .expect_err("invitation redirect must be explicit");
+        assert_eq!(missing, ConfigError::MissingSupabaseInviteRedirectUrl);
+
+        let insecure = SupabaseAdminConfig::from_values(
+            AppEnvironment::Staging,
+            "https://project.supabase.co",
+            "secret",
+            "http://web.example.com/aceptar-invitacion",
+        )
+        .expect_err("staging invitation redirect must use HTTPS");
+        assert_eq!(insecure, ConfigError::InsecureSupabaseInviteRedirectUrl);
     }
 }

@@ -4,10 +4,8 @@ export default function InternalPage() {
   return (
     <>
       <section className={styles.heading}>
-        <h1>Internal Console</h1>
-        <p>
-          Technical tools for verifying the services that support Agro Ops.
-        </p>
+        <h1>Consola técnica</h1>
+        <p>Herramientas para verificar los servicios que sostienen Agro Ops.</p>
       </section>
 
       <nav aria-label="Internal tools">
@@ -15,9 +13,9 @@ export default function InternalPage() {
           <li>
             <a className={styles.toolLink} href="/internal/system-status">
               <span className={styles.toolCopy}>
-                <span className={styles.toolName}>System Status</span>
+                <span className={styles.toolName}>Estado del sistema</span>
                 <span className={styles.toolDescription}>
-                  Live service health and backend version diagnostics.
+                  Salud de servicios y versión actual del backend.
                 </span>
               </span>
               <span className={styles.toolArrow} aria-hidden="true">

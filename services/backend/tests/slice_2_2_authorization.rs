@@ -279,6 +279,9 @@ fn subject_state(db: PgPool, subject: impl ToString) -> AppState {
         auth: Arc::new(TestAccessTokenVerifier {
             outcome: VerifierOutcome::Subject(subject.to_string()),
         }),
+        external_identity_admin: Arc::new(
+            agro_ops_backend::supabase_admin::UnavailableExternalIdentityAdmin,
+        ),
     }
 }
 
@@ -288,6 +291,9 @@ fn unavailable_verifier_state(db: PgPool) -> AppState {
         auth: Arc::new(TestAccessTokenVerifier {
             outcome: VerifierOutcome::Unavailable,
         }),
+        external_identity_admin: Arc::new(
+            agro_ops_backend::supabase_admin::UnavailableExternalIdentityAdmin,
+        ),
     }
 }
 

@@ -6,12 +6,14 @@ The Internal Console uses Supabase Auth with email/password accounts only. Set
 `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`, and
 `API_BASE_URL` before running or building the web application. The public values
 must be the URL and publishable key for the matching Supabase project; never use
-a service-role key here. Create and enable the allowed accounts in Supabase—this
-application intentionally provides no sign-up screen or local authentication bypass.
+a secret key here. The application intentionally provides no public sign-up
+screen or local authentication bypass. After the first administrator bootstrap,
+routine invitations and Agro Ops access are managed at `/configuracion/usuarios`.
 
-Unauthenticated requests to `/internal/*` redirect to `/login`. Supabase SSR
-cookies persist the authenticated session, and System Status forwards its access
-token only to the protected worker-status endpoint.
+Unauthenticated requests to `/internal/*` and `/configuracion/*` redirect to
+`/login`. Supabase SSR cookies persist the authenticated session. Server layouts
+call the backend `/me` endpoint before rendering protected content, and server
+actions forward the current access token to protected administration endpoints.
 
 The backend OpenAPI document at `/openapi.json` is also private. Retrieve it with
 an enabled user's Supabase access token as `Authorization: Bearer <token>`; do not
@@ -63,7 +65,7 @@ variables with the **Preview** target:
 
 `API_BASE_URL` is deliberately server-only: it is used by server-rendered
 backend status requests and must not be prefixed with `NEXT_PUBLIC_`. Do not add
-a Supabase service-role key, or any other privileged credential, to Vercel.
+a Supabase secret key, or any other privileged credential, to Vercel.
 
 The application validates these values during production builds, requires HTTPS
 outside local development, and fails the build if any required value is missing.

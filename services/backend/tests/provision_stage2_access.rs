@@ -1,10 +1,13 @@
 use std::sync::OnceLock;
 
 use agro_ops_backend::{
-    authorization::{self, permission_codes::CONSOLA_TECNICA_VER},
+    authorization::{
+        self,
+        permission_codes::{CONFIGURACION_ADMINISTRAR, CONSOLA_TECNICA_VER},
+    },
     stage2_access_provisioning::{
-        ProvisionStage2AccessError, ProvisionStage2AccessRequest, TECHNICAL_ROLE_NAME,
-        provision_stage2_access,
+        INITIAL_ADMIN_ROLE_NAME, ProvisionStage2AccessError, ProvisionStage2AccessRequest,
+        TECHNICAL_ROLE_NAME, bootstrap_stage2_administrator, provision_stage2_access,
     },
 };
 use sqlx::{PgPool, postgres::PgPoolOptions};
@@ -13,6 +16,37 @@ use uuid::Uuid;
 fn database_test_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+#[tokio::test]
+async fn explicit_first_administrator_bootstrap_grants_required_capabilities() {
+    let _guard = database_test_lock().lock().await;
+    let db = test_pool().await;
+    let request = request("initial-administrator");
+
+    let result = bootstrap_stage2_administrator(&db, &request)
+        .await
+        .expect("first administrator bootstrap must succeed");
+
+    assert_eq!(result.role_name, INITIAL_ADMIN_ROLE_NAME);
+    assert_eq!(
+        result.permission_codes,
+        [CONFIGURACION_ADMINISTRAR, CONSOLA_TECNICA_VER]
+    );
+    let context = authorization::resolve_context(&db, request.supabase_subject)
+        .await
+        .expect("bootstrapped administrator must authorize");
+    assert!(context.has_permission(CONFIGURACION_ADMINISTRAR));
+    assert!(context.has_permission(CONSOLA_TECNICA_VER));
+    let technical_role_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM public.roles WHERE organizacion_id = $1 AND nombre = $2",
+    )
+    .bind(result.organization_id)
+    .bind(TECHNICAL_ROLE_NAME)
+    .fetch_one(&db)
+    .await
+    .expect("technical role count must be queryable");
+    assert_eq!(technical_role_count, 0);
 }
 
 async fn test_pool() -> PgPool {

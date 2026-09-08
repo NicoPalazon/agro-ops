@@ -49,6 +49,8 @@ services:
       DATABASE_URL: postgres://agro_ops:agro_ops@postgres:5432/agro_ops
       SUPABASE_URL: ${SUPABASE_URL:-}
       SUPABASE_PUBLISHABLE_KEY: ${SUPABASE_PUBLISHABLE_KEY:-}
+      SUPABASE_SECRET_KEY: ${SUPABASE_SECRET_KEY:-}
+      SUPABASE_INVITE_REDIRECT_URL: ${SUPABASE_INVITE_REDIRECT_URL:-http://localhost:3000/aceptar-invitacion}
       RUST_LOG: info
 
     ports:

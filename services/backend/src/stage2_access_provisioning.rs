@@ -3,9 +3,13 @@ use std::{env, fmt};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::authorization::{SUPABASE_PROVIDER, permission_codes::CONSOLA_TECNICA_VER};
+use crate::authorization::{
+    SUPABASE_PROVIDER,
+    permission_codes::{CONFIGURACION_ADMINISTRAR, CONSOLA_TECNICA_VER},
+};
 
 pub const TECHNICAL_ROLE_NAME: &str = "Tecnico";
+pub const INITIAL_ADMIN_ROLE_NAME: &str = "Administrador inicial";
 
 /// Runtime values for the one-shot Stage 2 access bootstrap.
 ///
@@ -106,6 +110,15 @@ pub struct ProvisionStage2AccessResult {
     pub permission_code: &'static str,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BootstrapStage2AdministratorResult {
+    pub organization_id: Uuid,
+    pub user_id: Uuid,
+    pub supabase_subject: Uuid,
+    pub role_name: &'static str,
+    pub permission_codes: [&'static str; 2],
+}
+
 #[derive(Debug)]
 pub enum ProvisionStage2AccessError {
     Operational(String),
@@ -145,6 +158,46 @@ pub async fn provision_stage2_access(
     let result = provision_in_transaction(&mut transaction, request).await?;
     transaction.commit().await?;
     Ok(result)
+}
+
+/// Materialize the first trusted administrator without making the technical
+/// role administrative. This is intentionally a one-shot operational path.
+pub async fn bootstrap_stage2_administrator(
+    db: &PgPool,
+    request: &ProvisionStage2AccessRequest,
+) -> Result<BootstrapStage2AdministratorResult, ProvisionStage2AccessError> {
+    let mut transaction = db.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0::bigint))")
+        .bind(&request.organization_name)
+        .execute(&mut *transaction)
+        .await?;
+
+    let organization_id =
+        resolve_organization(&mut transaction, &request.organization_name).await?;
+    let user_id = resolve_user_and_identity(&mut transaction, organization_id, request).await?;
+    let role_id = resolve_initial_admin_role(&mut transaction, organization_id).await?;
+    let configuration_permission_id =
+        resolve_permission(&mut transaction, CONFIGURACION_ADMINISTRAR).await?;
+    let console_permission_id = resolve_permission(&mut transaction, CONSOLA_TECNICA_VER).await?;
+
+    ensure_current_user_role(&mut transaction, user_id, role_id).await?;
+    ensure_current_role_permission(&mut transaction, role_id, configuration_permission_id).await?;
+    ensure_current_role_permission(&mut transaction, role_id, console_permission_id).await?;
+    verify_exact_permissions(
+        &mut transaction,
+        role_id,
+        &[CONFIGURACION_ADMINISTRAR, CONSOLA_TECNICA_VER],
+    )
+    .await?;
+
+    transaction.commit().await?;
+    Ok(BootstrapStage2AdministratorResult {
+        organization_id,
+        user_id,
+        supabase_subject: request.supabase_subject,
+        role_name: INITIAL_ADMIN_ROLE_NAME,
+        permission_codes: [CONFIGURACION_ADMINISTRAR, CONSOLA_TECNICA_VER],
+    })
 }
 
 async fn provision_in_transaction(
@@ -227,6 +280,27 @@ async fn resolve_canonical_permission(
     }
 }
 
+async fn resolve_permission(
+    transaction: &mut Transaction<'_, Postgres>,
+    permission_code: &'static str,
+) -> Result<Uuid, ProvisionStage2AccessError> {
+    let permission: Option<(Uuid, bool)> =
+        sqlx::query_as("SELECT id, activo FROM public.permisos WHERE codigo = $1 FOR UPDATE")
+            .bind(permission_code)
+            .fetch_optional(&mut **transaction)
+            .await?;
+
+    match permission {
+        Some((permission_id, true)) => Ok(permission_id),
+        Some((_, false)) => Err(ProvisionStage2AccessError::Operational(format!(
+            "canonical permission {permission_code} is inactive; refusing to provision"
+        ))),
+        None => Err(ProvisionStage2AccessError::Operational(format!(
+            "canonical permission {permission_code} is missing; apply the approved Slice 2.1 migration"
+        ))),
+    }
+}
+
 async fn resolve_technical_role(
     transaction: &mut Transaction<'_, Postgres>,
     organization_id: Uuid,
@@ -249,6 +323,34 @@ async fn resolve_technical_role(
         )
         .bind(organization_id)
         .bind(TECHNICAL_ROLE_NAME)
+        .fetch_one(&mut **transaction)
+        .await?),
+    }
+}
+
+async fn resolve_initial_admin_role(
+    transaction: &mut Transaction<'_, Postgres>,
+    organization_id: Uuid,
+) -> Result<Uuid, ProvisionStage2AccessError> {
+    let role: Option<(Uuid, bool)> = sqlx::query_as(
+        "SELECT id, activo FROM public.roles WHERE organizacion_id = $1 AND nombre = $2 FOR UPDATE",
+    )
+    .bind(organization_id)
+    .bind(INITIAL_ADMIN_ROLE_NAME)
+    .fetch_optional(&mut **transaction)
+    .await?;
+
+    match role {
+        Some((role_id, true)) => Ok(role_id),
+        Some((_, false)) => Err(ProvisionStage2AccessError::Operational(
+            "matching Administrador inicial role is inactive; refusing to reactivate it".to_owned(),
+        )),
+        None => Ok(sqlx::query_scalar(
+            "INSERT INTO public.roles (organizacion_id, nombre, descripcion) VALUES ($1, $2, $3) RETURNING id",
+        )
+        .bind(organization_id)
+        .bind(INITIAL_ADMIN_ROLE_NAME)
+        .bind("Acceso de emergencia para el primer administrador de Agro Ops")
         .fetch_one(&mut **transaction)
         .await?),
     }
@@ -418,6 +520,39 @@ async fn verify_exact_current_role_permissions(
     if permission_codes.as_slice() != [CONSOLA_TECNICA_VER] {
         return Err(ProvisionStage2AccessError::Operational(
             "matching Tecnico role has permissions outside consola_tecnica:ver; refusing to alter its authorization profile"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn verify_exact_permissions(
+    transaction: &mut Transaction<'_, Postgres>,
+    role_id: Uuid,
+    expected: &[&str],
+) -> Result<(), ProvisionStage2AccessError> {
+    let permission_codes: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT permiso.codigo
+        FROM public.roles_permisos AS rol_permiso
+        JOIN public.permisos AS permiso ON permiso.id = rol_permiso.permiso_id
+        WHERE rol_permiso.rol_id = $1
+          AND tstzrange(rol_permiso.vigente_desde, rol_permiso.vigente_hasta, '[)') @> transaction_timestamp()
+        ORDER BY permiso.codigo
+        "#,
+    )
+    .bind(role_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+
+    if permission_codes
+        != expected
+            .iter()
+            .map(|permission| (*permission).to_owned())
+            .collect::<Vec<_>>()
+    {
+        return Err(ProvisionStage2AccessError::Operational(
+            "matching Administrador inicial role has unexpected permissions; refusing to alter its authorization profile"
                 .to_owned(),
         ));
     }
