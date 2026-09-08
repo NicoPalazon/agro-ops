@@ -21,6 +21,7 @@ temporary_dir="$(mktemp -d)"
 containers=()
 smoke_access_token="ci-smoke-access-token"
 smoke_publishable_key="sb_publishable_ci_smoke"
+smoke_supabase_subject="11111111-2222-4333-8444-555555555555"
 supabase_auth_url="http://supabase-auth:8080"
 
 cleanup() {
@@ -110,9 +111,10 @@ wait_for_http_200() {
 
 wait_for_healthy_worker() {
     local response_file="${temporary_dir}/worker-status.json"
-    local attempt status
+    local attempt status diagnostic="<empty response>"
 
     for attempt in {1..30}; do
+        : >"${response_file}"
         status="$(curl --silent --show-error --output "${response_file}" --write-out '%{http_code}' \
             --header "Authorization: Bearer ${smoke_access_token}" \
             "http://127.0.0.1:${api_port}/internal/worker/status" 2>/dev/null || true)"
@@ -123,7 +125,10 @@ wait_for_healthy_worker() {
         sleep 1
     done
 
-    fail "worker status did not become healthy within 30 seconds"
+    if [[ -s "${response_file}" ]]; then
+        diagnostic="$(head -c 512 "${response_file}" | tr '\n' ' ')"
+    fi
+    fail "worker status did not become healthy within 30 seconds; last HTTP status ${status:-curl-error}; response: ${diagnostic}"
 }
 
 wait_for_stale_worker() {
@@ -227,6 +232,56 @@ assert_startup_fails() {
     assert_log_has_no_secret "${log_file}"
 }
 
+seed_smoke_authorization() {
+    local permission_count
+
+    permission_count="$(docker exec "${postgres_container}" \
+        psql --username "${postgres_user}" --dbname "${postgres_database}" \
+        --tuples-only --no-align \
+        --command "SELECT count(*) FROM public.permisos WHERE codigo = 'consola_tecnica:ver';")"
+    [[ "${permission_count}" == "1" ]] \
+        || fail "expected exactly one canonical consola_tecnica:ver permission after migrations"
+
+    docker exec "${postgres_container}" \
+        psql --set ON_ERROR_STOP=1 --username "${postgres_user}" --dbname "${postgres_database}" \
+        --command "
+            WITH organizacion AS (
+                INSERT INTO public.organizaciones (nombre)
+                VALUES ('Docker smoke authorization')
+                RETURNING id
+            ),
+            usuario AS (
+                INSERT INTO public.usuarios (organizacion_id, nombre_completo)
+                SELECT id, 'Docker smoke technical operator'
+                FROM organizacion
+                RETURNING id
+            ),
+            identidad AS (
+                INSERT INTO public.identidades_autenticacion_externas
+                    (usuario_id, proveedor, sujeto_proveedor)
+                SELECT id, 'supabase', '${smoke_supabase_subject}'::uuid
+                FROM usuario
+            ),
+            rol AS (
+                INSERT INTO public.roles (organizacion_id, nombre)
+                SELECT organizacion.id, 'Tecnico smoke'
+                FROM organizacion
+                RETURNING id
+            ),
+            usuario_rol AS (
+                INSERT INTO public.usuarios_roles (usuario_id, rol_id)
+                SELECT usuario.id, rol.id
+                FROM usuario
+                CROSS JOIN rol
+            )
+            INSERT INTO public.roles_permisos (rol_id, permiso_id)
+            SELECT rol.id, permiso.id
+            FROM rol
+            CROSS JOIN public.permisos AS permiso
+            WHERE permiso.codigo = 'consola_tecnica:ver';
+        " >/dev/null
+}
+
 docker network create "${network_name}" >/dev/null
 
 docker volume create "${postgres_volume}" >/dev/null
@@ -246,12 +301,15 @@ postgres_port="$(docker inspect --format '{{(index (index .NetworkSettings.Ports
 migration_database_url="postgres://${postgres_user}:${postgres_password}@127.0.0.1:${postgres_port}/${postgres_database}?sslmode=disable"
 wait_for_host_postgres
 DATABASE_URL="${migration_database_url}" sqlx migrate run --source "${backend_dir}/migrations"
+seed_smoke_authorization
 
 docker run --detach --name "${supabase_auth_container}" --network "${network_name}" --network-alias supabase-auth \
     --env "SMOKE_ACCESS_TOKEN=${smoke_access_token}" \
     --env "SMOKE_PUBLISHABLE_KEY=${smoke_publishable_key}" \
+    --env "SMOKE_SUPABASE_SUBJECT=${smoke_supabase_subject}" \
     python:3.13-alpine \
     python -c '
+import json
 import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -264,7 +322,7 @@ class SupabaseAuthHandler(BaseHTTPRequestHandler):
         if self.headers.get("Authorization") != expected_authorization or self.headers.get("apikey") != os.environ["SMOKE_PUBLISHABLE_KEY"]:
             self.send_error(401)
             return
-        body = b"{\"id\":\"ci-smoke-user\"}"
+        body = json.dumps({"id": os.environ["SMOKE_SUPABASE_SUBJECT"]}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
