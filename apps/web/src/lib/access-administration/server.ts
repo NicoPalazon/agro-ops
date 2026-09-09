@@ -8,7 +8,7 @@ export interface RoleReference {
 export interface UserSummary {
   id: string;
   nombre_completo: string;
-  correo_electronico: string;
+  correo_electronico: string | null;
   activo: boolean;
   roles: RoleReference[];
 }

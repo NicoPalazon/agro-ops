@@ -1570,6 +1570,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configuration_user_list_remains_available_without_email_enrichment() {
+        let state = available_state().await;
+        let subject = Uuid::new_v4();
+        provision_internal_access(
+            &state.db,
+            subject,
+            authorization::permission_codes::CONFIGURACION_ADMINISTRAR,
+        )
+        .await;
+
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/configuracion/usuarios")
+                    .header("authorization", format!("Bearer {}", valid_token(subject)))
+                    .body(Body::empty())
+                    .expect("configuration user request must be valid"),
+            )
+            .await
+            .expect("configuration user request must complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_body(response).await)
+            .expect("configuration user response must be valid JSON");
+        let users = body["usuarios"]
+            .as_array()
+            .expect("configuration users must be an array");
+        assert_eq!(users.len(), 1);
+        assert!(users[0]["correo_electronico"].is_null());
+        assert_eq!(users[0]["activo"], true);
+        assert_eq!(users[0]["roles"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[tokio::test]
     async fn access_management_requires_configuration_administration_permission() {
         let state = available_state().await;
         let subject = Uuid::new_v4();

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use agro_ops_backend::{
     access_administration::{
@@ -15,6 +15,8 @@ use uuid::Uuid;
 #[derive(Clone)]
 struct MockExternalAdmin {
     result: Result<ExternalAuthUser, ExternalIdentityAdminError>,
+    email_lookup_error: Option<ExternalIdentityAdminError>,
+    unresolved_email_subjects: HashSet<Uuid>,
 }
 
 #[async_trait]
@@ -31,8 +33,12 @@ impl ExternalIdentityAdmin for MockExternalAdmin {
         &self,
         subjects: &[Uuid],
     ) -> Result<std::collections::HashMap<Uuid, String>, ExternalIdentityAdminError> {
+        if let Some(error) = self.email_lookup_error {
+            return Err(error);
+        }
         Ok(subjects
             .iter()
+            .filter(|subject| !self.unresolved_email_subjects.contains(subject))
             .map(|subject| (*subject, format!("{subject}@example.com")))
             .collect())
     }
@@ -51,6 +57,7 @@ struct AdminFixture {
     context: AuthorizationContext,
     organization_id: Uuid,
     administrator_user_id: Uuid,
+    administrator_subject: Uuid,
     administrator_role_id: Uuid,
 }
 
@@ -114,6 +121,7 @@ async fn admin_fixture() -> AdminFixture {
         context,
         organization_id,
         administrator_user_id: user_id,
+        administrator_subject: subject,
         administrator_role_id: role_id,
     }
 }
@@ -202,6 +210,8 @@ async fn create_user_with_roles(
 fn successful_external_admin(subject: Uuid) -> Arc<MockExternalAdmin> {
     Arc::new(MockExternalAdmin {
         result: Ok(ExternalAuthUser { subject }),
+        email_lookup_error: None,
+        unresolved_email_subjects: HashSet::new(),
     })
 }
 
@@ -240,6 +250,11 @@ async fn administrative_user_list_includes_current_supabase_email_for_duplicate_
         .filter(|user| user.nombre_completo == "Administrador de prueba")
         .collect();
     assert_eq!(duplicate_names.len(), 2);
+    assert!(
+        duplicate_names
+            .iter()
+            .all(|user| user.correo_electronico.is_some())
+    );
     assert_ne!(
         duplicate_names[0].correo_electronico,
         duplicate_names[1].correo_electronico
@@ -252,6 +267,94 @@ async fn administrative_user_list_includes_current_supabase_email_for_duplicate_
             .iter()
             .all(|user| user.get("correo_electronico").is_some())
     );
+}
+
+#[tokio::test]
+async fn deleted_supabase_subject_keeps_user_state_and_roles_with_null_email() {
+    let fixture = admin_fixture().await;
+    let external = MockExternalAdmin {
+        result: Ok(ExternalAuthUser {
+            subject: fixture.administrator_subject,
+        }),
+        email_lookup_error: None,
+        unresolved_email_subjects: HashSet::from([fixture.administrator_subject]),
+    };
+
+    let users = access_administration::list_users(&fixture.db, &external, &fixture.context)
+        .await
+        .expect("a deleted Supabase subject must not fail the PostgreSQL user list");
+    let administrator = users
+        .usuarios
+        .iter()
+        .find(|user| user.id == fixture.administrator_user_id)
+        .expect("the Agro Ops administrator must remain listed");
+
+    assert_eq!(administrator.correo_electronico, None);
+    assert!(administrator.activo);
+    assert_eq!(administrator.roles.len(), 1);
+    assert_eq!(administrator.roles[0].id, fixture.administrator_role_id);
+}
+
+#[tokio::test]
+async fn user_without_external_identity_keeps_inactive_state_and_roles_with_null_email() {
+    let fixture = admin_fixture().await;
+    let user_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO public.usuarios (organizacion_id, nombre_completo, activo) VALUES ($1, 'Usuario sin identidad', false) RETURNING id",
+    )
+    .bind(fixture.organization_id)
+    .fetch_one(&fixture.db)
+    .await
+    .expect("user without external identity must insert");
+    sqlx::query("INSERT INTO public.usuarios_roles (usuario_id, rol_id) VALUES ($1, $2)")
+        .bind(user_id)
+        .bind(fixture.administrator_role_id)
+        .execute(&fixture.db)
+        .await
+        .expect("test role assignment must insert");
+
+    let users = access_administration::list_users(
+        &fixture.db,
+        successful_external_admin(Uuid::new_v4()).as_ref(),
+        &fixture.context,
+    )
+    .await
+    .expect("a missing external identity must not fail the PostgreSQL user list");
+    let user = users
+        .usuarios
+        .iter()
+        .find(|user| user.id == user_id)
+        .expect("the user without an external identity must remain listed");
+
+    assert_eq!(user.correo_electronico, None);
+    assert!(!user.activo);
+    assert_eq!(user.roles.len(), 1);
+    assert_eq!(user.roles[0].id, fixture.administrator_role_id);
+}
+
+#[tokio::test]
+async fn unavailable_email_enrichment_keeps_authoritative_postgresql_users() {
+    let fixture = admin_fixture().await;
+    let external = MockExternalAdmin {
+        result: Ok(ExternalAuthUser {
+            subject: fixture.administrator_subject,
+        }),
+        email_lookup_error: Some(ExternalIdentityAdminError::Unavailable),
+        unresolved_email_subjects: HashSet::new(),
+    };
+
+    let users = access_administration::list_users(&fixture.db, &external, &fixture.context)
+        .await
+        .expect("unavailable email enrichment must not fail the PostgreSQL user list");
+    let administrator = users
+        .usuarios
+        .iter()
+        .find(|user| user.id == fixture.administrator_user_id)
+        .expect("the Agro Ops administrator must remain listed");
+
+    assert_eq!(administrator.correo_electronico, None);
+    assert!(administrator.activo);
+    assert_eq!(administrator.roles.len(), 1);
+    assert_eq!(administrator.roles[0].id, fixture.administrator_role_id);
 }
 
 #[tokio::test]
@@ -378,6 +481,8 @@ async fn supabase_admin_failure_creates_no_internal_user() {
     .expect("user count must be queryable");
     let external = MockExternalAdmin {
         result: Err(ExternalIdentityAdminError::Unavailable),
+        email_lookup_error: None,
+        unresolved_email_subjects: HashSet::new(),
     };
 
     let error = access_administration::create_or_enable_user(

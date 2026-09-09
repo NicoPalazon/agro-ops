@@ -82,6 +82,24 @@ describe("administración normal de accesos", () => {
     expect(markup).not.toContain("user-two-id");
   });
 
+  it("renders a neutral fallback for an unavailable email without exposing the user UUID", async () => {
+    const internalUserId = "00000000-0000-4000-8000-000000000001";
+    mocks.loadUsers.mockResolvedValue([
+      {
+        id: internalUserId,
+        nombre_completo: "Usuario sin correo",
+        correo_electronico: null,
+        activo: true,
+        roles: [],
+      },
+    ]);
+
+    const markup = renderToStaticMarkup(await UsersPage());
+
+    expect(markup).toContain("Correo no disponible");
+    expect(markup).not.toContain(internalUserId);
+  });
+
   it("renders role creation, activation and canonical permission membership", async () => {
     const markup = renderToStaticMarkup(await RolesPage());
 

@@ -155,15 +155,16 @@ impl SupabaseIdentityAdmin {
                 .map_err(|_| ExternalIdentityAdminError::Unavailable)?
                 .users;
             for user in &users {
-                let subject = Uuid::parse_str(&user.id)
-                    .map_err(|_| ExternalIdentityAdminError::Unavailable)?;
-                if subjects.contains(&subject) {
-                    let email = user
-                        .email
-                        .as_ref()
-                        .filter(|email| !email.is_empty())
-                        .ok_or(ExternalIdentityAdminError::Unavailable)?;
-                    emails.insert(subject, email.clone());
+                let Ok(subject) = Uuid::parse_str(&user.id) else {
+                    continue;
+                };
+                if let Some(email) = subjects
+                    .contains(&subject)
+                    .then_some(user.email.as_deref())
+                    .flatten()
+                    .filter(|email| !email.trim().is_empty())
+                {
+                    emails.insert(subject, email.to_owned());
                 }
             }
             if users.len() < USERS_PER_PAGE {
@@ -172,9 +173,7 @@ impl SupabaseIdentityAdmin {
             page += 1;
         }
 
-        (emails.len() == subjects.len())
-            .then_some(emails)
-            .ok_or(ExternalIdentityAdminError::Unavailable)
+        Ok(emails)
     }
 
     async fn invite(
@@ -535,6 +534,38 @@ mod tests {
 
         assert_eq!(error, ExternalIdentityAdminError::Unavailable);
         assert!(!format!("{error:?}").contains(SECRET_KEY));
+    }
+
+    #[tokio::test]
+    async fn email_enrichment_returns_resolved_matches_when_results_are_incomplete() {
+        let resolved_subject = Uuid::new_v4();
+        let empty_email_subject = Uuid::new_v4();
+        let deleted_subject = Uuid::new_v4();
+        let mock = mock_supabase_admin(
+            format!(
+                r#"{{"users":[{{"id":"{resolved_subject}","email":"resolved@example.com"}},{{"id":"{empty_email_subject}","email":"   "}},{{"id":"not-a-uuid","email":"ignored@example.com"}}]}}"#
+            ),
+            r#"{"id":"unused"}"#.to_owned(),
+        )
+        .await;
+
+        let emails = mock
+            .adapter
+            .correos_electronicos_por_sujeto(&[
+                resolved_subject,
+                empty_email_subject,
+                deleted_subject,
+            ])
+            .await
+            .expect("incomplete Supabase results must remain usable for display enrichment");
+
+        assert_eq!(emails.len(), 1);
+        assert_eq!(
+            emails.get(&resolved_subject).map(String::as_str),
+            Some("resolved@example.com")
+        );
+        assert!(!emails.contains_key(&empty_email_subject));
+        assert!(!emails.contains_key(&deleted_subject));
     }
 
     #[test]

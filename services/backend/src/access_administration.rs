@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, Transaction};
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
@@ -31,7 +32,7 @@ pub struct RoleReference {
 pub struct UserSummary {
     pub id: Uuid,
     pub nombre_completo: String,
-    pub correo_electronico: String,
+    pub correo_electronico: Option<String>,
     pub activo: bool,
     pub roles: Vec<RoleReference>,
 }
@@ -142,19 +143,35 @@ async fn list_users_for_organization(
     .await
     .map_err(|_| AccessAdministrationError::DatabaseUnavailable)?;
 
-    let subjects: Vec<Uuid> = rows.iter().filter_map(|row| row.3).collect();
-    let correos = external_admin
+    let mut subjects: Vec<Uuid> = rows.iter().filter_map(|row| row.3).collect();
+    subjects.sort_unstable();
+    subjects.dedup();
+    let (correos, enrichment_available) = match external_admin
         .correos_electronicos_por_sujeto(&subjects)
         .await
-        .map_err(map_external_error)?;
+    {
+        Ok(correos) => (correos, true),
+        Err(_) => {
+            warn_email_enrichment_unavailable(subjects.len());
+            (HashMap::new(), false)
+        }
+    };
 
     let mut users: Vec<UserSummary> = Vec::new();
+    let mut users_without_external_identity = 0usize;
+    let mut users_without_resolved_email = 0usize;
     for (id, nombre_completo, activo, subject, role_id, role_name) in rows {
         if users.last().is_none_or(|user| user.id != id) {
+            let correo_electronico = correo_electronico_actual(&correos, subject);
+            if subject.is_none() {
+                users_without_external_identity += 1;
+            } else if enrichment_available && correo_electronico.is_none() {
+                users_without_resolved_email += 1;
+            }
             users.push(UserSummary {
                 id,
                 nombre_completo,
-                correo_electronico: correo_electronico_actual(&correos, subject)?,
+                correo_electronico,
                 activo,
                 roles: Vec::new(),
             });
@@ -169,6 +186,13 @@ async fn list_users_for_organization(
                     nombre: role_name,
                 });
         }
+    }
+
+    if users_without_external_identity > 0 || users_without_resolved_email > 0 {
+        warn_email_enrichment_incomplete(
+            users_without_external_identity,
+            users_without_resolved_email,
+        );
     }
 
     Ok(UsersResponse { usuarios: users })
@@ -536,11 +560,31 @@ fn map_external_error(error: ExternalIdentityAdminError) -> AccessAdministration
 fn correo_electronico_actual(
     correos: &HashMap<Uuid, String>,
     subject: Option<Uuid>,
-) -> Result<String, AccessAdministrationError> {
+) -> Option<String> {
     subject
         .and_then(|subject| correos.get(&subject))
+        .filter(|correo_electronico| !correo_electronico.trim().is_empty())
         .cloned()
-        .ok_or(AccessAdministrationError::ExternalUnavailable)
+}
+
+fn warn_email_enrichment_unavailable(requested_subject_count: usize) {
+    warn!(
+        category = "supabase_email_enrichment_unavailable",
+        requested_subject_count,
+        "Supabase email enrichment is unavailable; returning users without unresolved emails"
+    );
+}
+
+fn warn_email_enrichment_incomplete(
+    users_without_external_identity: usize,
+    users_without_resolved_email: usize,
+) {
+    warn!(
+        category = "supabase_email_enrichment_incomplete",
+        users_without_external_identity,
+        users_without_resolved_email,
+        "Some users do not have a display email available"
+    );
 }
 
 fn map_write_error(error: sqlx::Error) -> AccessAdministrationError {
@@ -752,4 +796,68 @@ async fn load_role(
         .into_iter()
         .find(|role| role.id == role_id)
         .ok_or(AccessAdministrationError::NotFound)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::{self, Write},
+        sync::{Arc, Mutex},
+    };
+
+    use super::{warn_email_enrichment_incomplete, warn_email_enrichment_unavailable};
+
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("diagnostic buffer lock must be available")
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn email_enrichment_diagnostics_only_include_sanitized_categories_and_counts() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer_output = Arc::clone(&output);
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_writer(move || SharedWriter(Arc::clone(&writer_output)))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        warn_email_enrichment_unavailable(3);
+        warn_email_enrichment_incomplete(1, 2);
+
+        let diagnostics = String::from_utf8(
+            output
+                .lock()
+                .expect("diagnostic buffer lock must be available")
+                .clone(),
+        )
+        .expect("diagnostics must be UTF-8");
+        assert!(diagnostics.contains("supabase_email_enrichment_unavailable"));
+        assert!(diagnostics.contains("supabase_email_enrichment_incomplete"));
+        assert!(diagnostics.contains("requested_subject_count=3"));
+        assert!(diagnostics.contains("users_without_external_identity=1"));
+        assert!(diagnostics.contains("users_without_resolved_email=2"));
+        for forbidden in [
+            "user@example.com",
+            "00000000-0000-4000-8000-000000000001",
+            "bearer-token",
+            "secret-key",
+            "{\"users\":[]}",
+        ] {
+            assert!(!diagnostics.contains(forbidden));
+        }
+    }
 }
