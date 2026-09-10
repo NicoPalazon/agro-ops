@@ -53,7 +53,8 @@ printf '%s\n' '{
   "SUPABASE_URL": "https://project.supabase.co",
   "SUPABASE_PUBLISHABLE_KEY": "PUBLISHABLE_KEY_DO_NOT_LEAK_7f4f",
   "SUPABASE_SECRET_KEY": "SECRET_KEY_DO_NOT_LEAK_7f4f",
-  "SUPABASE_INVITE_REDIRECT_URL": "https://INVITE_REDIRECT_DO_NOT_LEAK_7f4f.example.test/aceptar-invitacion"
+  "SUPABASE_INVITE_REDIRECT_URL": "https://INVITE_REDIRECT_DO_NOT_LEAK_7f4f.example.test/aceptar-invitacion",
+  "SUPABASE_STORAGE_BUCKET": "documentos_privados"
 }' >"${valid_input}"
 
 valid_output="${preflight_test_temp_dir}/valid-output.txt"
@@ -67,7 +68,8 @@ printf '%s\n' '{
   "APP_ENV": "staging",
   "SUPABASE_URL": "https://project.supabase.co",
   "SUPABASE_PUBLISHABLE_KEY": "PUBLISHABLE_KEY_DO_NOT_LEAK_7f4f",
-  "SUPABASE_INVITE_REDIRECT_URL": "https://INVITE_REDIRECT_DO_NOT_LEAK_7f4f.example.test/aceptar-invitacion"
+  "SUPABASE_INVITE_REDIRECT_URL": "https://INVITE_REDIRECT_DO_NOT_LEAK_7f4f.example.test/aceptar-invitacion",
+  "SUPABASE_STORAGE_BUCKET": "documentos_privados"
 }' >"${missing_secret_input}"
 assert_failure_with_missing_names \
     "${missing_secret_input}" \
@@ -80,7 +82,8 @@ printf '%s\n' '{
   "APP_ENV": "staging",
   "SUPABASE_URL": "https://project.supabase.co",
   "SUPABASE_PUBLISHABLE_KEY": "PUBLISHABLE_KEY_DO_NOT_LEAK_7f4f",
-  "SUPABASE_SECRET_KEY": "SECRET_KEY_DO_NOT_LEAK_7f4f"
+  "SUPABASE_SECRET_KEY": "SECRET_KEY_DO_NOT_LEAK_7f4f",
+  "SUPABASE_STORAGE_BUCKET": "documentos_privados"
 }' >"${missing_redirect_input}"
 assert_failure_with_missing_names \
     "${missing_redirect_input}" \
@@ -98,7 +101,8 @@ assert_failure_with_missing_names \
     "${preflight_test_temp_dir}/missing-multiple-output.txt" \
     DATABASE_URL \
     SUPABASE_SECRET_KEY \
-    SUPABASE_INVITE_REDIRECT_URL
+    SUPABASE_INVITE_REDIRECT_URL \
+    SUPABASE_STORAGE_BUCKET
 
 empty_value_input="${preflight_test_temp_dir}/empty-value.json"
 printf '%s\n' '{
@@ -107,11 +111,26 @@ printf '%s\n' '{
   "SUPABASE_URL": "https://project.supabase.co",
   "SUPABASE_PUBLISHABLE_KEY": "PUBLISHABLE_KEY_DO_NOT_LEAK_7f4f",
   "SUPABASE_SECRET_KEY": "   ",
-  "SUPABASE_INVITE_REDIRECT_URL": "https://INVITE_REDIRECT_DO_NOT_LEAK_7f4f.example.test/aceptar-invitacion"
+  "SUPABASE_INVITE_REDIRECT_URL": "https://INVITE_REDIRECT_DO_NOT_LEAK_7f4f.example.test/aceptar-invitacion",
+  "SUPABASE_STORAGE_BUCKET": "documentos_privados"
 }' >"${empty_value_input}"
 assert_failure_with_missing_names \
     "${empty_value_input}" \
     "${preflight_test_temp_dir}/empty-value-output.txt" \
     SUPABASE_SECRET_KEY
+
+missing_storage_input="${preflight_test_temp_dir}/missing-storage.json"
+printf '%s\n' '{
+  "DATABASE_URL": "postgres://DATABASE_URL_DO_NOT_LEAK_7f4f@db.example.test/agro_ops",
+  "APP_ENV": "staging",
+  "SUPABASE_URL": "https://project.supabase.co",
+  "SUPABASE_PUBLISHABLE_KEY": "PUBLISHABLE_KEY_DO_NOT_LEAK_7f4f",
+  "SUPABASE_SECRET_KEY": "SECRET_KEY_DO_NOT_LEAK_7f4f",
+  "SUPABASE_INVITE_REDIRECT_URL": "https://INVITE_REDIRECT_DO_NOT_LEAK_7f4f.example.test/aceptar-invitacion"
+}' >"${missing_storage_input}"
+assert_failure_with_missing_names \
+    "${missing_storage_input}" \
+    "${preflight_test_temp_dir}/missing-storage-output.txt" \
+    SUPABASE_STORAGE_BUCKET
 
 echo "Railway API configuration preflight tests passed"

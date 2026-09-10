@@ -98,7 +98,7 @@ wait_for_http_200() {
     local attempt status
 
     for attempt in {1..30}; do
-        status="$(curl --silent --show-error --output "${response_file}" --write-out '%{http_code}' \
+        status="$(curl --silent --show-error --max-time 2 --output "${response_file}" --write-out '%{http_code}' \
             "http://127.0.0.1:${api_port}${path}" 2>/dev/null || true)"
         if [[ "${status}" == "200" ]]; then
             return
@@ -107,6 +107,24 @@ wait_for_http_200() {
     done
 
     fail "${path} did not return HTTP 200 within 30 seconds"
+}
+
+wait_for_http_status() {
+    local path="$1"
+    local expected_status="$2"
+    local response_file="${temporary_dir}/$(tr '/' '_' <<<"${path}")-${expected_status}.json"
+    local attempt status
+
+    for attempt in {1..30}; do
+        status="$(curl --silent --show-error --max-time 2 --output "${response_file}" --write-out '%{http_code}' \
+            "http://127.0.0.1:${api_port}${path}" 2>/dev/null || true)"
+        if [[ "${status}" == "${expected_status}" ]]; then
+            return
+        fi
+        sleep 1
+    done
+
+    fail "${path} did not return HTTP ${expected_status} within 30 seconds"
 }
 
 wait_for_healthy_worker() {
@@ -370,6 +388,12 @@ docker rm "${worker_container}" >/dev/null
 start_worker
 wait_for_healthy_worker
 assert_worker_heartbeat_row "${initial_heartbeat_epoch}" >/dev/null
+
+docker stop --time 10 "${postgres_container}" >/dev/null
+wait_for_http_status /ready 503
+
+docker stop --time 10 "${worker_container}" >/dev/null
+assert_container_exited_zero "${worker_container}" worker
 
 docker stop --time 10 "${api_container}" >/dev/null
 assert_container_exited_zero "${api_container}" API

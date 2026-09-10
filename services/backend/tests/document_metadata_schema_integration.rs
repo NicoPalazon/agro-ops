@@ -35,18 +35,20 @@ async fn insert_document(
     organization_id: Uuid,
     creator_id: Uuid,
     sha256: &[u8],
+    document_id: Uuid,
     key: String,
 ) -> Uuid {
     sqlx::query_scalar(
         r#"
         INSERT INTO documentos (
-            organizacion_id, nombre_original, tipo_mime, tamano_bytes,
+            id, organizacion_id, nombre_original, tipo_mime, tamano_bytes,
             sha256, storage_bucket, storage_key, creado_por
         )
-        VALUES ($1, 'factura.pdf', 'application/pdf', 42, $2, 'documentos_privados', $3, $4)
+        VALUES ($1, $2, 'factura.pdf', 'application/pdf', 42, $3, 'documentos_privados', $4, $5)
         RETURNING id
         "#,
     )
+    .bind(document_id)
     .bind(organization_id)
     .bind(sha256)
     .bind(key)
@@ -57,19 +59,20 @@ async fn insert_document(
 }
 
 #[tokio::test]
-async fn document_metadata_enforces_foreign_keys_cross_organization_actor_and_material_constraints()
-{
+async fn document_metadata_enforces_identity_foreign_keys_and_material_constraints() {
     let db = test_pool().await;
     let first_organization = organization(&db).await;
     let second_organization = organization(&db).await;
     let first_user = user(&db, first_organization).await;
     let second_user = user(&db, second_organization).await;
-    let document_id = insert_document(
+    let document_id = Uuid::new_v4();
+    insert_document(
         &db,
         first_organization,
         first_user,
         &[7; 32],
-        storage_key(first_organization, Uuid::new_v4()),
+        document_id,
+        storage_key(first_organization, document_id),
     )
     .await;
     let row: (Uuid, i64, Vec<u8>, String) = sqlx::query_as(
@@ -90,9 +93,9 @@ async fn document_metadata_enforces_foreign_keys_cross_organization_actor_and_ma
     );
 
     let invalid_statements = [
-        r#"INSERT INTO documentos (organizacion_id, nombre_original, tipo_mime, tamano_bytes, sha256, storage_bucket, storage_key, creado_por) VALUES ('00000000-0000-0000-0000-000000000001', 'x', 'text/plain', 1, decode(repeat('00', 32), 'hex'), 'documentos_privados', 'organizaciones/00000000-0000-0000-0000-000000000001/documentos/00000000-0000-0000-0000-000000000002/contenido', '00000000-0000-0000-0000-000000000003')"#,
-        r#"INSERT INTO documentos (organizacion_id, nombre_original, tipo_mime, tamano_bytes, sha256, storage_bucket, storage_key, creado_por) VALUES ($1, 'x', 'text/plain', 0, decode(repeat('00', 32), 'hex'), 'documentos_privados', $2, $3)"#,
-        r#"INSERT INTO documentos (organizacion_id, nombre_original, tipo_mime, tamano_bytes, sha256, storage_bucket, storage_key, creado_por) VALUES ($1, 'x', 'text/plain', 1, decode(repeat('00', 31), 'hex'), 'documentos_privados', $2, $3)"#,
+        r#"INSERT INTO documentos (id, organizacion_id, nombre_original, tipo_mime, tamano_bytes, sha256, storage_bucket, storage_key, creado_por) VALUES ('00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001', 'x', 'text/plain', 1, decode(repeat('00', 32), 'hex'), 'documentos_privados', 'organizaciones/00000000-0000-0000-0000-000000000001/documentos/00000000-0000-0000-0000-000000000002/contenido', '00000000-0000-0000-0000-000000000003')"#,
+        r#"INSERT INTO documentos (id, organizacion_id, nombre_original, tipo_mime, tamano_bytes, sha256, storage_bucket, storage_key, creado_por) VALUES ($4, $1, 'x', 'text/plain', 0, decode(repeat('00', 32), 'hex'), 'documentos_privados', $2, $3)"#,
+        r#"INSERT INTO documentos (id, organizacion_id, nombre_original, tipo_mime, tamano_bytes, sha256, storage_bucket, storage_key, creado_por) VALUES ($4, $1, 'x', 'text/plain', 1, decode(repeat('00', 31), 'hex'), 'documentos_privados', $2, $3)"#,
     ];
     let foreign_key_error = sqlx::query(invalid_statements[0])
         .execute(&db)
@@ -105,15 +108,17 @@ async fn document_metadata_enforces_foreign_keys_cross_organization_actor_and_ma
             .as_deref(),
         Some("23503")
     );
+    let missing_creator_document_id = Uuid::new_v4();
     let missing_creator = sqlx::query(
         r#"
-        INSERT INTO documentos (organizacion_id, nombre_original, tipo_mime, tamano_bytes, sha256, storage_bucket, storage_key, creado_por)
-        VALUES ($1, 'x', 'text/plain', 1, decode(repeat('00', 32), 'hex'), 'documentos_privados', $2, $3)
+        INSERT INTO documentos (id, organizacion_id, nombre_original, tipo_mime, tamano_bytes, sha256, storage_bucket, storage_key, creado_por)
+        VALUES ($4, $1, 'x', 'text/plain', 1, decode(repeat('00', 32), 'hex'), 'documentos_privados', $2, $3)
         "#,
     )
     .bind(first_organization)
-    .bind(storage_key(first_organization, Uuid::new_v4()))
+    .bind(storage_key(first_organization, missing_creator_document_id))
     .bind(Uuid::new_v4())
+    .bind(missing_creator_document_id)
     .execute(&db)
     .await
     .expect_err("missing creator must fail its restrictive FK");
@@ -125,10 +130,12 @@ async fn document_metadata_enforces_foreign_keys_cross_organization_actor_and_ma
         Some("23503")
     );
     for statement in invalid_statements.into_iter().skip(1) {
+        let invalid_document_id = Uuid::new_v4();
         let error = sqlx::query(statement)
             .bind(first_organization)
-            .bind(storage_key(first_organization, Uuid::new_v4()))
+            .bind(storage_key(first_organization, invalid_document_id))
             .bind(first_user)
+            .bind(invalid_document_id)
             .execute(&db)
             .await
             .expect_err("invalid document material value must fail");
@@ -141,15 +148,17 @@ async fn document_metadata_enforces_foreign_keys_cross_organization_actor_and_ma
         );
     }
 
+    let mismatch_document_id = Uuid::new_v4();
     let mismatch = sqlx::query(
         r#"
-        INSERT INTO documentos (organizacion_id, nombre_original, tipo_mime, tamano_bytes, sha256, storage_bucket, storage_key, creado_por)
-        VALUES ($1, 'x', 'text/plain', 1, decode(repeat('00', 32), 'hex'), 'documentos_privados', $2, $3)
+        INSERT INTO documentos (id, organizacion_id, nombre_original, tipo_mime, tamano_bytes, sha256, storage_bucket, storage_key, creado_por)
+        VALUES ($4, $1, 'x', 'text/plain', 1, decode(repeat('00', 32), 'hex'), 'documentos_privados', $2, $3)
         "#,
     )
     .bind(first_organization)
-    .bind(storage_key(first_organization, Uuid::new_v4()))
+    .bind(storage_key(first_organization, mismatch_document_id))
     .bind(second_user)
+    .bind(mismatch_document_id)
     .execute(&db)
     .await
     .expect_err("cross-organization creator must fail");
@@ -161,31 +170,61 @@ async fn document_metadata_enforces_foreign_keys_cross_organization_actor_and_ma
         database_error.message(),
         "agro_ops_documento_creador_organizacion_invalida"
     );
+
+    let mismatched_document_id = Uuid::new_v4();
+    let mismatched_storage_identity = sqlx::query(
+        r#"
+        INSERT INTO documentos (
+            id, organizacion_id, nombre_original, tipo_mime, tamano_bytes,
+            sha256, storage_bucket, storage_key, creado_por
+        )
+        VALUES ($1, $2, 'x', 'text/plain', 1, decode(repeat('00', 32), 'hex'),
+                'documentos_privados', $3, $4)
+        "#,
+    )
+    .bind(mismatched_document_id)
+    .bind(first_organization)
+    .bind(storage_key(second_organization, mismatched_document_id))
+    .bind(first_user)
+    .execute(&db)
+    .await
+    .expect_err("storage identity must match the document row");
+    assert_eq!(
+        mismatched_storage_identity
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("23514")
+    );
 }
 
 #[tokio::test]
-async fn duplicate_content_lookup_is_scoped_to_the_organization_and_storage_keys_are_unique() {
+async fn duplicate_content_lookup_is_scoped_and_storage_keys_follow_document_identity() {
     let db = test_pool().await;
     let first_organization = organization(&db).await;
     let second_organization = organization(&db).await;
     let first_user = user(&db, first_organization).await;
     let second_user = user(&db, second_organization).await;
     let hash = [19; 32];
-    let first_key = storage_key(first_organization, Uuid::new_v4());
+    let first_document_id = Uuid::new_v4();
+    let first_key = storage_key(first_organization, first_document_id);
     let first_document = insert_document(
         &db,
         first_organization,
         first_user,
         &hash,
+        first_document_id,
         first_key.clone(),
     )
     .await;
+    let second_document_id = Uuid::new_v4();
     let second_document = insert_document(
         &db,
         second_organization,
         second_user,
         &hash,
-        storage_key(second_organization, Uuid::new_v4()),
+        second_document_id,
+        storage_key(second_organization, second_document_id),
     )
     .await;
     let first_matches: Vec<Uuid> = sqlx::query_scalar(
@@ -198,26 +237,13 @@ async fn duplicate_content_lookup_is_scoped_to_the_organization_and_storage_keys
     .expect("duplicate lookup must work");
     assert_eq!(first_matches, vec![first_document]);
     assert_ne!(first_document, second_document);
-
-    let duplicate_key = sqlx::query(
-        r#"
-        INSERT INTO documentos (organizacion_id, nombre_original, tipo_mime, tamano_bytes, sha256, storage_bucket, storage_key, creado_por)
-        VALUES ($1, 'otro.pdf', 'application/pdf', 1, decode(repeat('ff', 32), 'hex'), 'documentos_privados', $2, $3)
-        "#,
-    )
-    .bind(first_organization)
-    .bind(first_key)
-    .bind(first_user)
-    .execute(&db)
-    .await
-    .expect_err("storage key uniqueness must hold");
-    assert_eq!(
-        duplicate_key
-            .as_database_error()
-            .and_then(|error| error.code())
-            .as_deref(),
-        Some("23505")
-    );
+    let persisted_key: String =
+        sqlx::query_scalar("SELECT storage_key FROM documentos WHERE id = $1")
+            .bind(first_document)
+            .fetch_one(&db)
+            .await
+            .expect("storage key must remain queryable");
+    assert_eq!(persisted_key, first_key);
 
     let organization_delete = sqlx::query("DELETE FROM organizaciones WHERE id = $1")
         .bind(first_organization)

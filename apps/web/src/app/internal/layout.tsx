@@ -6,8 +6,8 @@ import { SignOutButton } from "./sign-out-button";
 import styles from "./internal.module.css";
 
 export const metadata: Metadata = {
-  title: "Internal Console | Agro Ops",
-  description: "Technical diagnostics for the Agro Ops stack.",
+  title: "Consola técnica | Agro Ops",
+  description: "Diagnósticos técnicos de los servicios de Agro Ops.",
 };
 
 export default async function InternalLayout({

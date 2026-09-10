@@ -72,6 +72,9 @@ jobs:
 
       - name: Test Railway API configuration preflight
         run: bash scripts/validate-railway-api-config-test.sh
+
+      - name: Validate Docker Compose configuration
+        run: docker compose config --quiet
   backend-rust:
     name: Backend Rust
     runs-on: ubuntu-latest

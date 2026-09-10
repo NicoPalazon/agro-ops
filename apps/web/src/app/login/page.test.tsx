@@ -10,6 +10,6 @@ describe("Login page", () => {
 
     expect(markup).toContain('type="email"');
     expect(markup).toContain('type="password"');
-    expect(markup).not.toContain("Sign up");
+    expect(markup).not.toContain("Registrarse");
   });
 });

@@ -3,10 +3,10 @@ import { authenticatedAccessToken } from "@/lib/auth/server";
 import { loadSystemStatus, type DisplayStatus } from "./status";
 
 const statusLabels: Record<DisplayStatus, string> = {
-  operational: "Operational",
-  degraded: "Degraded",
-  stale: "Stale",
-  unavailable: "Unavailable",
+  operational: "Operativo",
+  degraded: "Degradado",
+  stale: "Desactualizado",
+  unavailable: "No disponible",
 };
 
 export default async function SystemStatusPage() {
@@ -15,18 +15,15 @@ export default async function SystemStatusPage() {
   return (
     <>
       <a className={styles.backLink} href="/internal">
-        ← Internal Console
+        ← Consola técnica
       </a>
 
       <section className={styles.heading}>
-        <h1>System Status</h1>
-        <p>
-          Live checks for the local services that make up the Agro Ops Walking
-          Skeleton.
-        </p>
+        <h1>Estado del sistema</h1>
+        <p>Verificaciones actuales de los servicios que sostienen Agro Ops.</p>
       </section>
 
-      <ul className={styles.statusList} aria-label="Service status">
+      <ul className={styles.statusList} aria-label="Estado de servicios">
         {status.services.map((service) => (
           <li
             className={styles.statusRow}
@@ -49,8 +46,8 @@ export default async function SystemStatusPage() {
       </ul>
 
       <dl className={styles.metadata}>
-        <dt>Backend version</dt>
-        <dd>{status.backendVersion ?? "Unavailable"}</dd>
+        <dt>Versión del backend</dt>
+        <dd>{status.backendVersion ?? "No disponible"}</dd>
       </dl>
     </>
   );

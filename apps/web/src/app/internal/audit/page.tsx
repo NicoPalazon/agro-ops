@@ -1,17 +1,7 @@
 import { authenticatedAccessToken } from "@/lib/auth/server";
 import styles from "../internal.module.css";
+import { formatDiagnosticTimestamp } from "../diagnostic-format";
 import { loadAudit } from "./audit";
-
-function timestamp(value: string): string {
-  const date = new Date(value);
-  return Number.isNaN(date.valueOf())
-    ? value
-    : new Intl.DateTimeFormat("es-AR", {
-        dateStyle: "short",
-        timeStyle: "medium",
-        timeZone: "America/Argentina/Buenos_Aires",
-      }).format(date);
-}
 
 function changeSummary(before: boolean, after: boolean): string {
   if (before && after) return "Estado anterior y posterior registrados";
@@ -64,7 +54,7 @@ export default async function AuditPage() {
             <tbody>
               {model.events.map((event) => (
                 <tr key={event.id}>
-                  <td>{timestamp(event.ocurrido_en)}</td>
+                  <td>{formatDiagnosticTimestamp(event.ocurrido_en)}</td>
                   <td><code>{event.accion}</code></td>
                   <td>
                     {event.actor_usuario_id

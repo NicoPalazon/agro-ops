@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use time::{Duration as TimeDuration, OffsetDateTime};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 struct FixedHandler {
@@ -219,9 +219,8 @@ async fn queue_enabled_worker_keeps_persisting_the_existing_heartbeat() {
         db.clone(),
         JobDispatcher::empty(),
     );
-    let (job_sender, job_receiver) = mpsc::channel(1);
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-    let task = tokio::spawn(runtime.run(job_receiver, async {
+    let task = tokio::spawn(runtime.run(async {
         let _ = shutdown_receiver.await;
     }));
     tokio::time::sleep(Duration::from_millis(25)).await;
@@ -229,8 +228,6 @@ async fn queue_enabled_worker_keeps_persisting_the_existing_heartbeat() {
         .send(())
         .expect("worker must remain available for shutdown");
     task.await.expect("worker must stop cleanly");
-    drop(job_sender);
-
     let recent: bool = sqlx::query_scalar(
         "SELECT last_seen_at >= statement_timestamp() - INTERVAL '1 second' FROM service_heartbeats WHERE service_name = 'worker'",
     )

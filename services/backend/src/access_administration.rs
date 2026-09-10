@@ -272,7 +272,7 @@ async fn list_roles_for_organization(
     Ok(RolesResponse { roles, permisos })
 }
 
-pub async fn create_or_enable_user(
+pub async fn create_user(
     db: &PgPool,
     external_admin: &dyn ExternalIdentityAdmin,
     context: &AuthorizationContext,

@@ -64,18 +64,81 @@ jobs:
 
           bash scripts/validate-railway-api-config.sh "${variables_json_path}"
 
-      - name: Deploy API
-        run: >-
-          railway up "$GITHUB_WORKSPACE/services/backend" --ci
-          --project "${RAILWAY_PROJECT_ID}"
-          --environment staging
-          --service "${RAILWAY_API_SERVICE_ID}"
-          --message "GitHub Actions ${GITHUB_SHA}"
+      - name: Deploy API and worker
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      - name: Deploy worker
-        run: >-
-          railway up "$GITHUB_WORKSPACE/services/backend" --ci
-          --project "${RAILWAY_PROJECT_ID}"
-          --environment staging
-          --service "${RAILWAY_WORKER_SERVICE_ID}"
-          --message "GitHub Actions ${GITHUB_SHA}"
+          deploy_and_wait() {
+            local service_name="$1"
+            local service_id="$2"
+            local deployment_json
+            local deployment_id
+            local deployments_json
+            local state=""
+            local previous_state=""
+            local deadline=$((SECONDS + 1800))
+
+            echo "Triggering ${service_name} deployment."
+            if ! deployment_json="$(timeout --foreground 10m railway up "$GITHUB_WORKSPACE/services/backend" --detach --json \
+              --project "${RAILWAY_PROJECT_ID}" \
+              --environment staging \
+              --service "${service_id}" \
+              --message "GitHub Actions ${GITHUB_SHA}")"
+            then
+              echo "Unable to trigger ${service_name} deployment." >&2
+              return 1
+            fi
+
+            deployment_id="$(jq -er '.deploymentId | strings | select(length > 0)' <<<"${deployment_json}")"
+            echo "${service_name} deployment ID: ${deployment_id}"
+
+            while (( SECONDS < deadline )); do
+              if ! deployments_json="$(timeout --foreground 30s railway deployment list --json --limit 100 \
+                --project "${RAILWAY_PROJECT_ID}" \
+                --environment staging \
+                --service "${service_id}")"
+              then
+                echo "Unable to read ${service_name} deployment ${deployment_id} state." >&2
+                return 1
+              fi
+
+              state="$(jq -r --arg deployment_id "${deployment_id}" \
+                '.[] | select(.id == $deployment_id) | .status' <<<"${deployments_json}")"
+              if [[ -z "${state}" ]]; then
+                state="NOT_FOUND"
+              fi
+
+              if [[ "${state}" != "${previous_state}" ]]; then
+                echo "${service_name} deployment ${deployment_id} state: ${state}"
+                previous_state="${state}"
+              fi
+
+              case "${state}" in
+                SUCCESS)
+                  return 0
+                  ;;
+                SKIPPED)
+                  echo "${service_name} deployment ${deployment_id} was skipped because Railway found no relevant source changes."
+                  return 0
+                  ;;
+                FAILED|CRASHED|REMOVED|REMOVING)
+                  echo "${service_name} deployment ${deployment_id} finished in failure state ${state}." >&2
+                  return 1
+                  ;;
+                NOT_FOUND|QUEUED|WAITING|INITIALIZING|BUILDING|DEPLOYING)
+                  sleep 10
+                  ;;
+                *)
+                  echo "${service_name} deployment ${deployment_id} reached unexpected state ${state}." >&2
+                  return 1
+                  ;;
+              esac
+            done
+
+            echo "Timed out after 30 minutes waiting for ${service_name} deployment ${deployment_id}." >&2
+            return 1
+          }
+
+          deploy_and_wait "API" "${RAILWAY_API_SERVICE_ID}"
+          deploy_and_wait "worker" "${RAILWAY_WORKER_SERVICE_ID}"

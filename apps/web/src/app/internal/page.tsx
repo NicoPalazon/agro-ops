@@ -8,7 +8,7 @@ export default function InternalPage() {
         <p>Herramientas para verificar los servicios que sostienen Agro Ops.</p>
       </section>
 
-      <nav aria-label="Internal tools">
+      <nav aria-label="Herramientas internas">
         <ul className={styles.toolList}>
           <li>
             <a className={styles.toolLink} href="/internal/system-status">

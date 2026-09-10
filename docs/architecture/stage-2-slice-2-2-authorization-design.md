@@ -333,7 +333,7 @@ La implementación siguiente debe limitarse a:
 | `services/backend/src/lib.rs` | Exportar `authorization`, extraer/autenticar, resolver el contexto, mapear 401/403/5xx y proteger los dos handlers Internal |
 | `services/backend/src/bin/api.rs` | Sin nueva dependencia de autorización; continúa construyendo `AppState` con `PgPool` y verifier |
 | `services/backend/Cargo.toml` | Agregar únicamente la feature SQLx `uuid` |
-| `services/backend/tests/slice_2_2_authorization.rs` (nuevo) | Fixtures SQL, resolución real y pruebas HTTP enfocadas contra PostgreSQL |
+| `services/backend/tests/authorization_api_integration.rs` (nuevo) | Fixtures SQL, resolución real y pruebas HTTP enfocadas contra PostgreSQL |
 
 No se agrega otro crate, trait genérico de RBAC, macro, middleware global de permisos ni repositorio de roles visible para handlers. La consulta queda encapsulada en `authorization`; la frontera Axum sólo conoce el contexto y los errores tipados.
 
@@ -412,7 +412,7 @@ Como las relaciones históricas prohíben borrado, la suite debe ejecutarse cont
 
 ### 12.3. Pruebas directas de autorización PostgreSQL
 
-En `tests/slice_2_2_authorization.rs`, contra PostgreSQL real:
+En `tests/authorization_api_integration.rs`, contra PostgreSQL real:
 
 - vínculo vigente + usuario/organización activos resuelve IDs internos correctos;
 - falta de vínculo, vínculo expirado y vínculo futuro producen `PrincipalUnavailable`;

@@ -1,5 +1,6 @@
 import { authenticatedAccessToken } from "@/lib/auth/server";
 import styles from "../internal.module.css";
+import { formatDiagnosticTimestamp } from "../diagnostic-format";
 import type { JobState } from "../jobs/jobs";
 import { loadOutbox } from "./outbox";
 
@@ -9,18 +10,6 @@ const stateLabels: Record<JobState, string> = {
   completado: "Completado",
   agotado: "Agotado",
 };
-
-function timestamp(value: string | null): string {
-  if (!value) return "—";
-  const date = new Date(value);
-  return Number.isNaN(date.valueOf())
-    ? value
-    : new Intl.DateTimeFormat("es-AR", {
-        dateStyle: "short",
-        timeStyle: "medium",
-        timeZone: "America/Argentina/Buenos_Aires",
-      }).format(date);
-}
 
 export default async function OutboxPage() {
   const model = await loadOutbox(await authenticatedAccessToken());
@@ -91,8 +80,8 @@ export default async function OutboxPage() {
                   <td>
                     {event.intentos} / {event.max_intentos}
                   </td>
-                  <td>{timestamp(event.next_attempt_at)}</td>
-                  <td>{timestamp(event.actualizado_en)}</td>
+                  <td>{formatDiagnosticTimestamp(event.next_attempt_at)}</td>
+                  <td>{formatDiagnosticTimestamp(event.actualizado_en)}</td>
                   <td>{event.ultimo_error ?? "—"}</td>
                 </tr>
               ))}

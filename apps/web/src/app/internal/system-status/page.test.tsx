@@ -40,7 +40,7 @@ function mockBackend(responses: Record<string, MockResponse>) {
   return fetchMock;
 }
 
-describe("System Status", () => {
+describe("Estado del sistema", () => {
   beforeEach(() => {
     auth.accessToken.mockResolvedValue("authenticated-access-token");
   });
@@ -124,7 +124,7 @@ describe("System Status", () => {
     expect(markup).toContain(
       'data-service="worker" data-status="unavailable"',
     );
-    expect(markup).toContain("Backend version</dt><dd>Unavailable");
+    expect(markup).toContain("Versión del backend</dt><dd>No disponible");
   });
 
   it("does not display failed service checks as operational", async () => {

@@ -4,7 +4,7 @@ use ::time::OffsetDateTime;
 use async_trait::async_trait;
 use sqlx::PgPool;
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::mpsc,
     time::{self, MissedTickBehavior},
 };
 use tracing::{info, warn};
@@ -17,23 +17,6 @@ use crate::{
     },
     service_heartbeats::{WORKER_SERVICE_NAME, record_service_heartbeat},
 };
-
-const WALKING_SKELETON_TEST_JOB_ID: &str = "walking-skeleton-test-job";
-
-/// In-memory work item retained only for the established runtime smoke path.
-pub enum WorkerJob {
-    WalkingSkeletonTest { completed: oneshot::Sender<()> },
-}
-
-pub fn walking_skeleton_test_job() -> (WorkerJob, oneshot::Receiver<()>) {
-    let (completed_sender, completed_receiver) = oneshot::channel();
-    (
-        WorkerJob::WalkingSkeletonTest {
-            completed: completed_sender,
-        },
-        completed_receiver,
-    )
-}
 
 #[derive(Clone, Copy, Debug)]
 pub struct WorkerSettings {
@@ -130,7 +113,7 @@ impl Worker {
         self.worker_id
     }
 
-    pub async fn run<S>(self, mut in_memory_jobs: mpsc::Receiver<WorkerJob>, shutdown: S)
+    pub async fn run<S>(self, shutdown: S)
     where
         S: Future<Output = ()>,
     {
@@ -141,18 +124,10 @@ impl Worker {
         queue_poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         tokio::pin!(shutdown);
-        let mut in_memory_jobs_open = true;
-
         loop {
             tokio::select! {
                 _ = heartbeat.tick() => self.heartbeat().await,
                 _ = queue_poll.tick() => self.process_queue_once().await,
-                job = in_memory_jobs.recv(), if in_memory_jobs_open => {
-                    match job {
-                        Some(job) => self.process_in_memory(job).await,
-                        None => in_memory_jobs_open = false,
-                    }
-                }
                 _ = &mut shutdown => {
                     info!(service = "worker", worker_id = %self.worker_id, "worker shutdown requested");
                     self.notify(WorkerEvent::Stopped);
@@ -267,27 +242,6 @@ impl Worker {
         self.notify(WorkerEvent::Heartbeat);
     }
 
-    async fn process_in_memory(&self, job: WorkerJob) {
-        match job {
-            WorkerJob::WalkingSkeletonTest { completed } => {
-                info!(
-                    service = "worker",
-                    job_id = WALKING_SKELETON_TEST_JOB_ID,
-                    "worker job received"
-                );
-                self.notify(WorkerEvent::JobReceived(WALKING_SKELETON_TEST_JOB_ID));
-                tokio::task::yield_now().await;
-                info!(
-                    service = "worker",
-                    job_id = WALKING_SKELETON_TEST_JOB_ID,
-                    "worker job completed"
-                );
-                self.notify(WorkerEvent::JobCompleted(WALKING_SKELETON_TEST_JOB_ID));
-                let _ = completed.send(());
-            }
-        }
-    }
-
     fn notify(&self, event: WorkerEvent) {
         if let Some(event_sender) = &self.event_sender {
             let _ = event_sender.send(event);
@@ -317,14 +271,15 @@ impl Worker {
 #[derive(Debug, PartialEq, Eq)]
 enum WorkerEvent {
     Heartbeat,
-    JobReceived(&'static str),
-    JobCompleted(&'static str),
     Stopped,
 }
 
 #[cfg(test)]
 mod tests {
-    use tokio::{sync::oneshot, time::timeout};
+    use tokio::{
+        sync::{mpsc, oneshot},
+        time::timeout,
+    };
 
     use super::*;
 
@@ -338,11 +293,10 @@ mod tests {
 
     #[tokio::test]
     async fn emits_heartbeat_and_stops_cleanly() {
-        let (job_sender, job_receiver) = mpsc::channel(1);
         let (event_sender, mut events) = mpsc::unbounded_channel();
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
         let worker = Worker::with_event_sender(Duration::from_millis(5), event_sender);
-        let worker_task = tokio::spawn(worker.run(job_receiver, async {
+        let worker_task = tokio::spawn(worker.run(async {
             let _ = shutdown_receiver.await;
         }));
 
@@ -362,41 +316,5 @@ mod tests {
             Some(WorkerEvent::Stopped)
         );
         worker_task.await.expect("worker task must finish cleanly");
-        drop(job_sender);
-    }
-
-    #[tokio::test]
-    async fn receives_and_completes_one_test_job_exactly_once() {
-        let (job_sender, job_receiver) = mpsc::channel(1);
-        let (event_sender, mut events) = mpsc::unbounded_channel();
-        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-        let worker = Worker::with_event_sender(Duration::from_secs(60), event_sender);
-        let (job, completed) = walking_skeleton_test_job();
-        job_sender
-            .send(job)
-            .await
-            .expect("worker queue must be open");
-        let worker_task = tokio::spawn(worker.run(job_receiver, async {
-            let _ = shutdown_receiver.await;
-        }));
-
-        timeout(Duration::from_secs(1), completed)
-            .await
-            .expect("test job must finish before the timeout")
-            .expect("test job completion sender must remain available");
-        shutdown_sender
-            .send(())
-            .expect("worker must still be running");
-        worker_task.await.expect("worker task must finish cleanly");
-
-        let observed: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
-        assert_eq!(
-            observed,
-            vec![
-                WorkerEvent::JobReceived(WALKING_SKELETON_TEST_JOB_ID),
-                WorkerEvent::JobCompleted(WALKING_SKELETON_TEST_JOB_ID),
-                WorkerEvent::Stopped,
-            ]
-        );
     }
 }

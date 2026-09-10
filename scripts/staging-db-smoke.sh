@@ -2,6 +2,9 @@
 
 set -Eeuo pipefail
 
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+migrations_dir="${repo_root}/services/backend/migrations"
+
 fail() {
     echo "staging database smoke failed: $*" >&2
     exit 1
@@ -43,9 +46,25 @@ query() {
 [[ -n "$(query "PostGIS function check failed" "SELECT PostGIS_Version();")" ]] \
     || fail "PostGIS did not return a version"
 
+mapfile -t migration_files < <(find "${migrations_dir}" -maxdepth 1 -type f -name '*.sql' -printf '%f\n' | sort)
+(( ${#migration_files[@]} > 0 )) || fail "no repository migrations were found"
+
+migration_versions=()
+for migration_file in "${migration_files[@]}"; do
+    migration_version="${migration_file%%_*}"
+    [[ "${migration_version}" =~ ^[0-9]+$ ]] \
+        || fail "migration filename does not begin with a numeric version"
+    migration_versions+=("${migration_version}")
+done
+migration_version_list="$(IFS=,; printf '%s' "${migration_versions[*]}")"
+
 [[ "$(query "SQLx migration history check failed" \
-    "SELECT COUNT(*) FROM _sqlx_migrations WHERE success AND version IN (20260903000000, 20260903010000);")" == "2" ]] \
-    || fail "required Walking Skeleton migrations are not applied"
+    "SELECT COUNT(*) FROM _sqlx_migrations WHERE success AND version IN (${migration_version_list});")" == "${#migration_versions[@]}" ]] \
+    || fail "not every repository migration is applied successfully"
+
+[[ "$(query "failed SQLx migration history check failed" \
+    "SELECT COUNT(*) FROM _sqlx_migrations WHERE NOT success;")" == "0" ]] \
+    || fail "SQLx migration history contains a failed migration"
 
 query "service_heartbeats table is missing or not queryable" \
     "SELECT service_name, last_seen_at FROM service_heartbeats LIMIT 0;" >/dev/null

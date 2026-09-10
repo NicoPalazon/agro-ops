@@ -335,7 +335,7 @@ impl Modify for SupabaseBearerSecurity {
     info(
         title = "Agro Ops API",
         version = env!("CARGO_PKG_VERSION"),
-        description = "HTTP contract for Agro Ops backend health and system status endpoints."
+        description = "HTTP contract for Agro Ops public health and protected transversal endpoints."
     ),
     paths(health, ready, version, me, internal_worker_status, internal_system_status, internal_jobs, internal_outbox, internal_audit, internal_idempotencia, create_document, document_metadata, document_download),
     components(schemas(StatusResponse, VersionResponse, MeResponse, SystemStatusResponse, ServiceStatus, ServiceStatusReport, jobs::JobState, jobs::JobDiagnostic, jobs::JobsDiagnosticsResponse, outbox::OutboxDiagnostic, outbox::OutboxDiagnosticsResponse, audit::AuditDiagnostic, audit::AuditDiagnosticsResponse, idempotency::IdempotencyDiagnostic, idempotency::IdempotencyDiagnosticsResponse, documents::DocumentMetadata, documents::CreatedDocument, documents::DocumentDownloadResponse)),
@@ -575,7 +575,7 @@ async fn configuration_create_user(
         authorization::permission_codes::CONFIGURACION_ADMINISTRAR,
     )
     .await?;
-    let user = access_administration::create_or_enable_user(
+    let user = access_administration::create_user(
         &state.db,
         state.external_identity_admin.as_ref(),
         &context,

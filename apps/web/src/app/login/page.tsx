@@ -5,7 +5,7 @@ import styles from "./login.module.css";
 import { LoginSubmitButton } from "./submit-button";
 
 export const metadata: Metadata = {
-  title: "Sign in | Agro Ops",
+  title: "Iniciar sesión | Agro Ops",
 };
 
 interface LoginPageProps {
@@ -20,20 +20,20 @@ export default async function LoginPage({ searchParams }: LoginPageProps) {
     <main className={styles.page}>
       <section className={styles.card} aria-labelledby="login-title">
         <h1 id="login-title">Agro Ops</h1>
-        <p>Sign in to access the Internal Console.</p>
+        <p>Iniciá sesión para acceder a Agro Ops.</p>
         {params.error === "invalid_credentials" ? (
           <p className={styles.error} role="alert">
-            Your email or password was not accepted.
+            El correo electrónico o la contraseña no son correctos.
           </p>
         ) : null}
         <form action={login} className={styles.form}>
           <input name="next" type="hidden" value={returnPath} />
           <label>
-            Email
+            Correo electrónico
             <input autoComplete="email" name="email" required type="email" />
           </label>
           <label>
-            Password
+            Contraseña
             <input
               autoComplete="current-password"
               name="password"

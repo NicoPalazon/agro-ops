@@ -324,7 +324,7 @@ async fn database_constraints_and_restrictive_organization_history_are_enforced(
     .await;
     assert!(missing_organization.is_err());
 
-    commit_registration(
+    let preserved = commit_registration(
         &db,
         reference(
             Some(organization_id),
@@ -335,6 +335,29 @@ async fn database_constraints_and_restrictive_organization_history_are_enforced(
         ),
     )
     .await;
+    let delete_reference = sqlx::query("DELETE FROM external_references WHERE id = $1")
+        .bind(preserved.reference.id)
+        .execute(&db)
+        .await
+        .expect_err("external identity history must not be deleted");
+    assert_eq!(
+        delete_reference
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("P0001")
+    );
+    let truncate_references = sqlx::query("TRUNCATE TABLE external_references")
+        .execute(&db)
+        .await
+        .expect_err("external identity history must not be truncated");
+    assert_eq!(
+        truncate_references
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("P0001")
+    );
     let delete_organization = sqlx::query("DELETE FROM organizaciones WHERE id = $1")
         .bind(organization_id)
         .execute(&db)

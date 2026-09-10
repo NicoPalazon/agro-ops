@@ -23,7 +23,7 @@ interface FetchResult {
   data?: unknown;
 }
 
-const unavailableDetail = "The check could not reach the backend.";
+const unavailableDetail = "No se pudo contactar al backend.";
 export const BACKEND_REQUEST_TIMEOUT_MS = 5_000;
 
 async function fetchInternal(
@@ -80,7 +80,7 @@ function simpleServiceCheck(
       service,
       label,
       status: "operational",
-      detail: `${label} check completed successfully.`,
+      detail: `La verificación de ${label} finalizó correctamente.`,
     };
   }
 
@@ -88,7 +88,7 @@ function simpleServiceCheck(
     service,
     label,
     status: "degraded",
-    detail: `${label} check did not report a healthy state.`,
+    detail: `La verificación de ${label} no informó un estado saludable.`,
   };
 }
 
@@ -118,8 +118,8 @@ function workerServiceCheck(result: FetchResult, payload: unknown): ServiceCheck
       label: "Worker",
       status: status === "healthy" ? "operational" : status,
       detail: lastSeenAt
-        ? `Last heartbeat: ${lastSeenAt}`
-        : "No persisted worker heartbeat is available.",
+        ? `Último heartbeat: ${lastSeenAt}`
+        : "No hay un heartbeat persistido del worker.",
     };
   }
 
@@ -127,7 +127,7 @@ function workerServiceCheck(result: FetchResult, payload: unknown): ServiceCheck
     service: "worker",
     label: "Worker",
     status: "degraded",
-    detail: "The worker check returned an invalid response.",
+    detail: "La verificación del worker devolvió una respuesta inválida.",
   };
 }
 
@@ -151,10 +151,16 @@ export async function loadSystemStatus(
         service: "web",
         label: "Web",
         status: "operational",
-        detail: "The Internal Console rendered successfully.",
+        detail: "La Consola técnica se renderizó correctamente.",
       },
       simpleServiceCheck("api", "API", result, payload?.api, "ok"),
-      simpleServiceCheck("database", "Database", result, payload?.database, "ready"),
+      simpleServiceCheck(
+        "database",
+        "Base de datos",
+        result,
+        payload?.database,
+        "ready",
+      ),
       workerServiceCheck(result, payload?.worker),
     ],
     backendVersion: backendVersion(result, payload?.version),

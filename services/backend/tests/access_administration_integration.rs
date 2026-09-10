@@ -207,7 +207,7 @@ async fn create_user_with_roles(
     subject: Uuid,
     roles_ids: Vec<Uuid>,
 ) -> access_administration::UserSummary {
-    access_administration::create_or_enable_user(
+    access_administration::create_user(
         &fixture.db,
         successful_external_admin(subject).as_ref(),
         &fixture.context,
@@ -413,7 +413,7 @@ async fn administrator_links_supabase_subject_and_assigns_roles_transactionally(
     .await;
     let subject = Uuid::new_v4();
 
-    let user = access_administration::create_or_enable_user(
+    let user = access_administration::create_user(
         &fixture.db,
         successful_external_admin(subject).as_ref(),
         &fixture.context,
@@ -665,7 +665,7 @@ async fn external_success_followed_by_internal_failure_grants_no_agro_ops_access
     .expect("foreign role must insert");
     let subject = Uuid::new_v4();
 
-    let error = access_administration::create_or_enable_user(
+    let error = access_administration::create_user(
         &fixture.db,
         successful_external_admin(subject).as_ref(),
         &fixture.context,
@@ -700,7 +700,7 @@ async fn external_success_followed_by_internal_failure_grants_no_agro_ops_access
     .expect("failed creation audit count must be queryable");
     assert_eq!(failed_creation_audits, 0);
 
-    let retried = access_administration::create_or_enable_user(
+    let retried = access_administration::create_user(
         &fixture.db,
         successful_external_admin(subject).as_ref(),
         &fixture.context,
@@ -739,7 +739,7 @@ async fn audit_insert_failure_rolls_back_the_internal_user_creation() {
     .expect("test audit constraint must install");
 
     let subject = Uuid::new_v4();
-    let result = access_administration::create_or_enable_user(
+    let result = access_administration::create_user(
         &fixture.db,
         successful_external_admin(subject).as_ref(),
         &fixture.context,
@@ -794,7 +794,7 @@ async fn supabase_admin_failure_creates_no_internal_user() {
         unresolved_email_subjects: HashSet::new(),
     };
 
-    let error = access_administration::create_or_enable_user(
+    let error = access_administration::create_user(
         &fixture.db,
         &external,
         &fixture.context,
@@ -824,7 +824,7 @@ async fn posting_an_existing_same_organization_subject_conflicts_without_mutatio
     let subject = Uuid::new_v4();
     let external = successful_external_admin(subject);
 
-    let first = access_administration::create_or_enable_user(
+    let first = access_administration::create_user(
         &fixture.db,
         external.as_ref(),
         &fixture.context,
@@ -850,7 +850,7 @@ async fn posting_an_existing_same_organization_subject_conflicts_without_mutatio
     .await
     .expect("the non-administrator user may be disabled");
 
-    let error = access_administration::create_or_enable_user(
+    let error = access_administration::create_user(
         &fixture.db,
         external.as_ref(),
         &fixture.context,
@@ -907,7 +907,7 @@ async fn subject_linked_to_another_organization_is_never_relinked() {
     .await
     .expect("existing identity must insert");
 
-    let error = access_administration::create_or_enable_user(
+    let error = access_administration::create_user(
         &fixture.db,
         successful_external_admin(subject).as_ref(),
         &fixture.context,
@@ -941,7 +941,7 @@ async fn disabling_user_and_changing_roles_affect_the_next_authorization_request
     )
     .await;
     let subject = Uuid::new_v4();
-    let user = access_administration::create_or_enable_user(
+    let user = access_administration::create_user(
         &fixture.db,
         successful_external_admin(subject).as_ref(),
         &fixture.context,

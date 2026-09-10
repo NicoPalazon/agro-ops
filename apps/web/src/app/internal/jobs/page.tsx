@@ -1,5 +1,6 @@
 import { authenticatedAccessToken } from "@/lib/auth/server";
 import styles from "../internal.module.css";
+import { formatDiagnosticTimestamp } from "../diagnostic-format";
 import { loadJobs, type JobState } from "./jobs";
 
 const stateLabels: Record<JobState, string> = {
@@ -8,18 +9,6 @@ const stateLabels: Record<JobState, string> = {
   completado: "Completado",
   agotado: "Agotado",
 };
-
-function timestamp(value: string | null): string {
-  if (!value) return "—";
-  const date = new Date(value);
-  return Number.isNaN(date.valueOf())
-    ? value
-    : new Intl.DateTimeFormat("es-AR", {
-        dateStyle: "short",
-        timeStyle: "medium",
-        timeZone: "America/Argentina/Buenos_Aires",
-      }).format(date);
-}
 
 export default async function JobsPage() {
   const model = await loadJobs(await authenticatedAccessToken());
@@ -79,18 +68,18 @@ export default async function JobsPage() {
                   <td>
                     {job.intentos} / {job.max_intentos}
                   </td>
-                  <td>{timestamp(job.next_attempt_at)}</td>
+                  <td>{formatDiagnosticTimestamp(job.next_attempt_at)}</td>
                   <td>
                     {job.bloqueado_en ? (
                       <span>
-                        {timestamp(job.bloqueado_en)}
+                        {formatDiagnosticTimestamp(job.bloqueado_en)}
                         {job.bloqueado_por ? ` · ${job.bloqueado_por}` : ""}
                       </span>
                     ) : (
                       "—"
                     )}
                   </td>
-                  <td>{timestamp(job.actualizado_en)}</td>
+                  <td>{formatDiagnosticTimestamp(job.actualizado_en)}</td>
                   <td>{job.ultimo_error ?? "—"}</td>
                 </tr>
               ))}

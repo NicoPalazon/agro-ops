@@ -2,10 +2,9 @@ use agro_ops_backend::{
     config::RuntimeConfig,
     shutdown::shutdown_signal,
     telemetry::init_tracing,
-    worker::{JobDispatcher, Worker, WorkerSettings, walking_skeleton_test_job},
+    worker::{JobDispatcher, Worker, WorkerSettings},
 };
 use sqlx::postgres::PgPoolOptions;
-use tokio::sync::mpsc;
 use tracing::{error, info};
 
 #[tokio::main]
@@ -44,37 +43,16 @@ async fn main() {
         db,
         JobDispatcher::empty(),
     );
-    let (job_sender, job_receiver) = mpsc::channel(1);
-
-    if std::env::args().any(|argument| argument == "--test-job-once") {
-        let (job, completed) = walking_skeleton_test_job();
-
-        job_sender
-            .send(job)
-            .await
-            .expect("worker must be available for the walking skeleton test job");
-
-        worker
-            .run(job_receiver, async {
-                completed
-                    .await
-                    .expect("walking skeleton test job must complete");
-            })
-            .await;
-    } else {
-        let _job_sender = job_sender;
-
-        worker
-            .run(job_receiver, async {
-                let signal = shutdown_signal().await;
-                info!(
-                    service = "worker",
-                    signal = signal.as_str(),
-                    "shutdown signal received"
-                );
-            })
-            .await;
-    }
+    worker
+        .run(async {
+            let signal = shutdown_signal().await;
+            info!(
+                service = "worker",
+                signal = signal.as_str(),
+                "shutdown signal received"
+            );
+        })
+        .await;
 
     info!(service = "worker", "Agro Ops worker stopped");
 }

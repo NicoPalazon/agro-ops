@@ -1,17 +1,7 @@
 import { authenticatedAccessToken } from "@/lib/auth/server";
 import styles from "../internal.module.css";
+import { formatDiagnosticTimestamp } from "../diagnostic-format";
 import { loadIdempotency } from "./idempotencia";
-
-function timestamp(value: string): string {
-  const date = new Date(value);
-  return Number.isNaN(date.valueOf())
-    ? value
-    : new Intl.DateTimeFormat("es-AR", {
-        dateStyle: "short",
-        timeStyle: "medium",
-        timeZone: "America/Argentina/Buenos_Aires",
-      }).format(date);
-}
 
 export default async function IdempotencyPage() {
   const model = await loadIdempotency(await authenticatedAccessToken());
@@ -61,7 +51,7 @@ export default async function IdempotencyPage() {
                   <td><code>{record.operacion}</code></td>
                   <td><code>{record.idempotency_key}</code></td>
                   <td><code>{record.request_sha256}</code></td>
-                  <td>{timestamp(record.completado_en)}</td>
+                  <td>{formatDiagnosticTimestamp(record.completado_en)}</td>
                   <td>{record.resultado_bytes} bytes</td>
                 </tr>
               ))}
