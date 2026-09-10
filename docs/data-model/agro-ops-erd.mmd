@@ -46,17 +46,22 @@ erDiagram
         BASE_PLOT
         CAMPAIGN
         OPERATIONAL_UNIT
+        OPERATIONAL_UNIT_BASE_PLOT
         ACTIVITY_USE
         OPERATIONAL_UNIT_USE
 
         ESTABLISHMENT ||..o{ BASE_PLOT : contains
+        ORGANIZATION ||--o{ CAMPAIGN : owns
         CAMPAIGN ||--o{ OPERATIONAL_UNIT : defines
+        ESTABLISHMENT ||--o{ OPERATIONAL_UNIT : scopes
+        OPERATIONAL_UNIT ||--|{ OPERATIONAL_UNIT_BASE_PLOT : uses
+        BASE_PLOT ||--o{ OPERATIONAL_UNIT_BASE_PLOT : contributes
         OPERATIONAL_UNIT ||--o{ OPERATIONAL_UNIT_USE : has_use
         ACTIVITY_USE ||--o{ OPERATIONAL_UNIT_USE : assigned_as
 
         %% OperationalUnitUse is an identifying, history-preserving association.
         %% Campaign-specific subdivision does not rewrite earlier Campaign geography.
-        %% Campaign <-> Establishment and BasePlot <-> OperationalUnit are intentionally unresolved.
+        %% UOP/BasePlot is M:N within one Establishment; different Campaign partitions stay isolated.
     end
 
     subgraph INVENTORY["INVENTORY / GRAIN LEDGER"]
@@ -179,8 +184,6 @@ erDiagram
     %% - Local entity <-> ExternalReference generic target representation
     %% - Business change <-> OutboxEvent generic source representation
     %% Etapa 3:
-    %% - Campaign <-> Establishment
-    %% - BasePlot <-> OperationalUnit
     %% - OperationalUnitUse simultaneity and confirmation obligatoriness
     %% Etapa 4-7:
     %% - Product <-> UnitOfMeasure cardinality/conversions

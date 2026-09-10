@@ -1,6 +1,6 @@
 use std::fmt;
 
-use time::OffsetDateTime;
+use time::{Date, OffsetDateTime};
 use uuid::Uuid;
 
 use crate::external_references::ExternalId;
@@ -108,6 +108,47 @@ pub struct LoteBase {
     /// EWKT by PostGIS. It is never a RENSPA/SENASA property perimeter.
     pub geometria_ewkt: String,
     pub activo: bool,
+    pub creado_por: Uuid,
+    pub creado_en: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Campana {
+    pub id: Uuid,
+    pub organization_id: Uuid,
+    pub codigo: CanonicalTerritorialCode,
+    pub nombre: FunctionalName,
+    pub fecha_inicio: Date,
+    pub fecha_fin: Date,
+    pub activa: bool,
+    pub creado_por: Uuid,
+    pub creado_en: OffsetDateTime,
+}
+
+/// Campaign-specific geography within exactly one establishment. A different
+/// campaign always receives different operational-unit identities.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnidadOperativa {
+    pub id: Uuid,
+    pub organization_id: Uuid,
+    pub campana_id: Uuid,
+    pub establecimiento_id: Uuid,
+    pub codigo: CanonicalTerritorialCode,
+    pub nombre: FunctionalName,
+    pub geometria_ewkt: String,
+    pub activa: bool,
+    pub creado_por: Uuid,
+    pub creado_en: OffsetDateTime,
+}
+
+/// Normalized M:N association explaining which stable base plots cover a UOP.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnidadOperativaLoteBase {
+    pub id: Uuid,
+    pub organization_id: Uuid,
+    pub establecimiento_id: Uuid,
+    pub unidad_operativa_id: Uuid,
+    pub lote_base_id: Uuid,
     pub creado_por: Uuid,
     pub creado_en: OffsetDateTime,
 }
