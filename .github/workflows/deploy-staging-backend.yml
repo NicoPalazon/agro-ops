@@ -66,7 +66,7 @@ jobs:
 
       - name: Deploy API
         run: >-
-          railway up services/backend --path-as-root --ci
+          railway up services/backend --ci
           --project "${RAILWAY_PROJECT_ID}"
           --environment staging
           --service "${RAILWAY_API_SERVICE_ID}"
@@ -74,7 +74,7 @@ jobs:
 
       - name: Deploy worker
         run: >-
-          railway up services/backend --path-as-root --ci
+          railway up services/backend --ci
           --project "${RAILWAY_PROJECT_ID}"
           --environment staging
           --service "${RAILWAY_WORKER_SERVICE_ID}"
