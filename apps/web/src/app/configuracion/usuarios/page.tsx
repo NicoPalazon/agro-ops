@@ -6,6 +6,7 @@ import {
   updateUserAction,
 } from "../actions";
 import styles from "../configuracion.module.css";
+import { UserEditForm } from "./user-edit-form";
 
 export default async function UsersPage() {
   const token = await authenticatedAccessToken();
@@ -61,29 +62,11 @@ export default async function UsersPage() {
                 {user.activo ? "Habilitado" : "Deshabilitado"}
               </span>
             </div>
-            <form action={updateUserAction.bind(null, user.id)} className={styles.form}>
-              <label>
-                Nombre completo
-                <input defaultValue={user.nombre_completo} name="nombre_completo" required />
-              </label>
-              <fieldset>
-                <legend>Roles asignados</legend>
-                <div className={styles.options}>
-                  {activeRoles.map((role) => (
-                    <label key={role.id}>
-                      <input
-                        defaultChecked={user.roles.some((assigned) => assigned.id === role.id)}
-                        name="roles_ids"
-                        type="checkbox"
-                        value={role.id}
-                      />
-                      {role.nombre}
-                    </label>
-                  ))}
-                </div>
-              </fieldset>
-              <button type="submit">Guardar</button>
-            </form>
+            <UserEditForm
+              action={updateUserAction.bind(null, user.id)}
+              activeRoles={activeRoles}
+              user={user}
+            />
             <form action={setUserActiveAction.bind(null, user.id, !user.activo)}>
               <button className={styles.secondary} type="submit">
                 {user.activo ? "Deshabilitar" : "Habilitar"}

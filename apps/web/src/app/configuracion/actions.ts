@@ -29,11 +29,12 @@ export async function createUserAction(formData: FormData) {
 }
 
 export async function updateUserAction(userId: string, formData: FormData) {
-  await updateUser(await accessToken(), userId, {
+  const user = await updateUser(await accessToken(), userId, {
     nombre_completo: String(formData.get("nombre_completo") ?? ""),
     roles_ids: selected(formData, "roles_ids"),
   });
   revalidatePath("/configuracion/usuarios");
+  return user;
 }
 
 export async function setUserActiveAction(userId: string, active: boolean) {

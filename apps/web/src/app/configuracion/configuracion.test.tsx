@@ -53,7 +53,8 @@ describe("administración normal de accesos", () => {
     expect(markup).toContain("Encargado");
     expect(markup).toContain("ana@example.com");
     expect(markup).toContain("Deshabilitar");
-    expect(markup).toContain("Guardar");
+    expect(markup).toContain("Guardar cambios");
+    expect(markup).toContain('disabled=""');
   });
 
   it("distinguishes users with the same full name by their email address", async () => {
