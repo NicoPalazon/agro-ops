@@ -1,16 +1,27 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Transaction};
 use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
+    audit::{self, AuditActor, NewAuditEvent},
     authorization::{
         AuthorizationContext, SUPABASE_PROVIDER, permission_codes::CONFIGURACION_ADMINISTRAR,
     },
     supabase_admin::{ExternalIdentityAdmin, ExternalIdentityAdminError},
 };
+
+const USUARIO_CREADO: &str = "usuario.creado";
+const USUARIO_HABILITADO: &str = "usuario.habilitado";
+const USUARIO_DESHABILITADO: &str = "usuario.deshabilitado";
+const USUARIO_ROLES_ACTUALIZADOS: &str = "usuario.roles_actualizados";
+const ROL_CREADO: &str = "rol.creado";
+const ROL_HABILITADO: &str = "rol.habilitado";
+const ROL_DESHABILITADO: &str = "rol.deshabilitado";
+const ROL_PERMISOS_ACTUALIZADOS: &str = "rol.permisos_actualizados";
 
 type UserWithCurrentRoleRow = (
     Uuid,
@@ -318,6 +329,16 @@ pub async fn create_or_enable_user(
     .map_err(map_write_error)?;
 
     synchronize_user_roles(&mut transaction, user_id, &roles).await?;
+    record_administrative_audit(
+        &mut transaction,
+        context,
+        USUARIO_CREADO,
+        "usuario",
+        user_id,
+        None,
+        Some(user_created_snapshot(user_id, &roles)),
+    )
+    .await?;
     transaction
         .commit()
         .await
@@ -353,17 +374,22 @@ pub async fn update_user(
             .map_err(|_| AccessAdministrationError::DatabaseUnavailable)?;
     }
 
-    let user_exists: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM public.usuarios WHERE id = $1 AND organizacion_id = $2 FOR UPDATE",
+    let user: Option<(Uuid, bool)> = sqlx::query_as(
+        "SELECT id, activo FROM public.usuarios WHERE id = $1 AND organizacion_id = $2 FOR UPDATE",
     )
     .bind(user_id)
     .bind(context.organization_id)
     .fetch_optional(&mut *transaction)
     .await
     .map_err(|_| AccessAdministrationError::DatabaseUnavailable)?;
-    if user_exists.is_none() {
+    let Some((_, previous_active)) = user else {
         return Err(AccessAdministrationError::NotFound);
-    }
+    };
+    let previous_roles = if roles.is_some() {
+        current_user_role_ids(&mut transaction, user_id).await?
+    } else {
+        Vec::new()
+    };
 
     if let Some(full_name) = full_name {
         sqlx::query("UPDATE public.usuarios SET nombre_completo = $1 WHERE id = $2")
@@ -388,6 +414,37 @@ pub async fn update_user(
     if may_reduce_administrators {
         ensure_organization_has_effective_administrator(&mut transaction, context.organization_id)
             .await?;
+    }
+    if let Some(active) = request.activo.filter(|active| *active != previous_active) {
+        record_administrative_audit(
+            &mut transaction,
+            context,
+            if active {
+                USUARIO_HABILITADO
+            } else {
+                USUARIO_DESHABILITADO
+            },
+            "usuario",
+            user_id,
+            Some(user_active_snapshot(user_id, previous_active)),
+            Some(user_active_snapshot(user_id, active)),
+        )
+        .await?;
+    }
+    if roles.is_some() {
+        let resulting_roles = current_user_role_ids(&mut transaction, user_id).await?;
+        if resulting_roles != previous_roles {
+            record_administrative_audit(
+                &mut transaction,
+                context,
+                USUARIO_ROLES_ACTUALIZADOS,
+                "usuario",
+                user_id,
+                Some(user_roles_snapshot(user_id, &previous_roles)),
+                Some(user_roles_snapshot(user_id, &resulting_roles)),
+            )
+            .await?;
+        }
     }
 
     transaction
@@ -420,6 +477,17 @@ pub async fn create_role(
     .await
     .map_err(map_write_error)?;
     synchronize_role_permissions(&mut transaction, role_id, &permission_ids).await?;
+    let permission_codes = current_role_permission_codes(&mut transaction, role_id).await?;
+    record_administrative_audit(
+        &mut transaction,
+        context,
+        ROL_CREADO,
+        "rol",
+        role_id,
+        None,
+        Some(role_created_snapshot(role_id, &permission_codes)),
+    )
+    .await?;
     transaction
         .commit()
         .await
@@ -465,17 +533,22 @@ pub async fn update_role(
             .map_err(|_| AccessAdministrationError::DatabaseUnavailable)?;
     }
 
-    let role_exists: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM public.roles WHERE id = $1 AND organizacion_id = $2 FOR UPDATE",
+    let role: Option<(Uuid, bool)> = sqlx::query_as(
+        "SELECT id, activo FROM public.roles WHERE id = $1 AND organizacion_id = $2 FOR UPDATE",
     )
     .bind(role_id)
     .bind(context.organization_id)
     .fetch_optional(&mut *transaction)
     .await
     .map_err(|_| AccessAdministrationError::DatabaseUnavailable)?;
-    if role_exists.is_none() {
+    let Some((_, previous_active)) = role else {
         return Err(AccessAdministrationError::NotFound);
-    }
+    };
+    let previous_permissions = if permissions.is_some() {
+        current_role_permission_codes(&mut transaction, role_id).await?
+    } else {
+        Vec::new()
+    };
 
     if let Some(name) = name {
         sqlx::query("UPDATE public.roles SET nombre = $1 WHERE id = $2")
@@ -508,6 +581,38 @@ pub async fn update_role(
     if may_reduce_administrators {
         ensure_organization_has_effective_administrator(&mut transaction, context.organization_id)
             .await?;
+    }
+    if let Some(active) = request.activo.filter(|active| *active != previous_active) {
+        record_administrative_audit(
+            &mut transaction,
+            context,
+            if active {
+                ROL_HABILITADO
+            } else {
+                ROL_DESHABILITADO
+            },
+            "rol",
+            role_id,
+            Some(role_active_snapshot(role_id, previous_active)),
+            Some(role_active_snapshot(role_id, active)),
+        )
+        .await?;
+    }
+    if permissions.is_some() {
+        let resulting_permissions =
+            current_role_permission_codes(&mut transaction, role_id).await?;
+        if resulting_permissions != previous_permissions {
+            record_administrative_audit(
+                &mut transaction,
+                context,
+                ROL_PERMISOS_ACTUALIZADOS,
+                "rol",
+                role_id,
+                Some(role_permissions_snapshot(role_id, &previous_permissions)),
+                Some(role_permissions_snapshot(role_id, &resulting_permissions)),
+            )
+            .await?;
+        }
     }
 
     transaction
@@ -594,6 +699,112 @@ fn map_write_error(error: sqlx::Error) -> AccessAdministrationError {
         }
         _ => AccessAdministrationError::DatabaseUnavailable,
     }
+}
+
+async fn record_administrative_audit(
+    transaction: &mut Transaction<'_, Postgres>,
+    context: &AuthorizationContext,
+    action: &'static str,
+    entity_type: &'static str,
+    entity_id: Uuid,
+    before_state: Option<Value>,
+    after_state: Option<Value>,
+) -> Result<(), AccessAdministrationError> {
+    audit::record(
+        transaction,
+        &NewAuditEvent {
+            organization_id: context.organization_id,
+            actor: AuditActor::Usuario(context.user_id),
+            action,
+            entity_type,
+            entity_id: Some(entity_id),
+            reference: None,
+            before_state,
+            after_state,
+        },
+    )
+    .await
+    .map_err(|_| AccessAdministrationError::DatabaseUnavailable)?;
+    Ok(())
+}
+
+fn user_created_snapshot(user_id: Uuid, role_ids: &[Uuid]) -> Value {
+    json!({
+        "usuario_id": user_id,
+        "activo": true,
+        "roles_ids": role_ids,
+    })
+}
+
+fn user_active_snapshot(user_id: Uuid, active: bool) -> Value {
+    json!({
+        "usuario_id": user_id,
+        "activo": active,
+    })
+}
+
+fn user_roles_snapshot(user_id: Uuid, role_ids: &[Uuid]) -> Value {
+    json!({
+        "usuario_id": user_id,
+        "roles_ids": role_ids,
+    })
+}
+
+fn role_created_snapshot(role_id: Uuid, permission_codes: &[String]) -> Value {
+    json!({
+        "rol_id": role_id,
+        "activo": true,
+        "permisos": permission_codes,
+    })
+}
+
+fn role_active_snapshot(role_id: Uuid, active: bool) -> Value {
+    json!({
+        "rol_id": role_id,
+        "activo": active,
+    })
+}
+
+fn role_permissions_snapshot(role_id: Uuid, permission_codes: &[String]) -> Value {
+    json!({
+        "rol_id": role_id,
+        "permisos": permission_codes,
+    })
+}
+
+async fn current_user_role_ids(
+    transaction: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+) -> Result<Vec<Uuid>, AccessAdministrationError> {
+    sqlx::query_scalar(
+        "SELECT rol_id FROM public.usuarios_roles WHERE usuario_id = $1 AND tstzrange(vigente_desde, vigente_hasta, '[)') @> statement_timestamp() ORDER BY rol_id",
+    )
+    .bind(user_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|_| AccessAdministrationError::DatabaseUnavailable)
+}
+
+async fn current_role_permission_codes(
+    transaction: &mut Transaction<'_, Postgres>,
+    role_id: Uuid,
+) -> Result<Vec<String>, AccessAdministrationError> {
+    sqlx::query_scalar(
+        r#"
+        SELECT permiso.codigo
+        FROM public.roles_permisos AS rol_permiso
+        JOIN public.permisos AS permiso ON permiso.id = rol_permiso.permiso_id
+        WHERE rol_permiso.rol_id = $1
+          AND permiso.activo
+          AND tstzrange(rol_permiso.vigente_desde, rol_permiso.vigente_hasta, '[)')
+              @> statement_timestamp()
+        ORDER BY permiso.codigo
+        "#,
+    )
+    .bind(role_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|_| AccessAdministrationError::DatabaseUnavailable)
 }
 
 async fn validate_roles(

@@ -9,8 +9,22 @@ use agro_ops_backend::{
     supabase_admin::{ExternalAuthUser, ExternalIdentityAdmin, ExternalIdentityAdminError},
 };
 use async_trait::async_trait;
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use serde_json::{Value, json};
+use sqlx::{AssertSqlSafe, PgPool, postgres::PgPoolOptions, types::Json};
 use uuid::Uuid;
+
+type StoredAuditEvent = (
+    Uuid,
+    String,
+    Option<Uuid>,
+    String,
+    String,
+    Option<Uuid>,
+    Option<Json<Value>>,
+    Option<Json<Value>>,
+);
+
+const CONFIGURATION_VIEW_PERMISSION: &str = "configuracion:ver";
 
 #[derive(Clone)]
 struct MockExternalAdmin {
@@ -215,6 +229,37 @@ fn successful_external_admin(subject: Uuid) -> Arc<MockExternalAdmin> {
     })
 }
 
+async fn audit_events_for_entity(fixture: &AdminFixture, entity_id: Uuid) -> Vec<StoredAuditEvent> {
+    sqlx::query_as(
+        r#"
+        SELECT
+            organizacion_id,
+            actor_tipo,
+            actor_usuario_id,
+            accion,
+            entidad_tipo,
+            entidad_id,
+            estado_anterior,
+            estado_posterior
+        FROM public.audit_events
+        WHERE organizacion_id = $1 AND entidad_id = $2
+        ORDER BY ocurrido_en, id
+        "#,
+    )
+    .bind(fixture.organization_id)
+    .bind(entity_id)
+    .fetch_all(&fixture.db)
+    .await
+    .expect("audit events must be queryable")
+}
+
+fn audit_event_by_action<'a>(events: &'a [StoredAuditEvent], action: &str) -> &'a StoredAuditEvent {
+    events
+        .iter()
+        .find(|event| event.3 == action)
+        .expect("expected audit action must exist")
+}
+
 #[tokio::test]
 async fn administrative_user_list_includes_current_supabase_email_for_duplicate_names() {
     let fixture = admin_fixture().await;
@@ -398,6 +443,211 @@ async fn administrator_links_supabase_subject_and_assigns_roles_transactionally(
 }
 
 #[tokio::test]
+async fn user_creation_activity_and_role_changes_append_safe_administrative_audit_events() {
+    let fixture = admin_fixture().await;
+    let first_role = role_with_permissions(
+        &fixture,
+        "Operador inicial",
+        &[permission_codes::CONSOLA_TECNICA_VER],
+    )
+    .await;
+    let replacement_role = role_with_permissions(&fixture, "Operador reemplazo", &[]).await;
+    let user = create_user_with_roles(&fixture, Uuid::new_v4(), vec![first_role]).await;
+
+    access_administration::update_user(
+        &fixture.db,
+        successful_external_admin(Uuid::new_v4()).as_ref(),
+        &fixture.context,
+        user.id,
+        &UpdateUserRequest {
+            nombre_completo: None,
+            activo: Some(false),
+            roles_ids: Some(vec![replacement_role]),
+        },
+    )
+    .await
+    .expect("user activity and roles must update");
+    access_administration::update_user(
+        &fixture.db,
+        successful_external_admin(Uuid::new_v4()).as_ref(),
+        &fixture.context,
+        user.id,
+        &UpdateUserRequest {
+            nombre_completo: None,
+            activo: Some(true),
+            roles_ids: None,
+        },
+    )
+    .await
+    .expect("user must re-enable");
+
+    let events = audit_events_for_entity(&fixture, user.id).await;
+    assert_eq!(events.len(), 4);
+    for event in &events {
+        assert_eq!(event.0, fixture.organization_id);
+        assert_eq!(event.1, "usuario");
+        assert_eq!(event.2, Some(fixture.administrator_user_id));
+        assert_eq!(event.4, "usuario");
+        assert_eq!(event.5, Some(user.id));
+    }
+    let created = audit_event_by_action(&events, "usuario.creado");
+    let disabled = audit_event_by_action(&events, "usuario.deshabilitado");
+    let roles_changed = audit_event_by_action(&events, "usuario.roles_actualizados");
+    let enabled = audit_event_by_action(&events, "usuario.habilitado");
+    assert_eq!(created.6, None);
+    assert_eq!(
+        created.7.as_ref().map(|value| &value.0),
+        Some(&json!({
+            "usuario_id": user.id,
+            "activo": true,
+            "roles_ids": [first_role],
+        }))
+    );
+    assert_eq!(
+        disabled.6.as_ref().map(|value| &value.0),
+        Some(&json!({"usuario_id": user.id, "activo": true}))
+    );
+    assert_eq!(
+        disabled.7.as_ref().map(|value| &value.0),
+        Some(&json!({"usuario_id": user.id, "activo": false}))
+    );
+    assert_eq!(
+        roles_changed.6.as_ref().map(|value| &value.0),
+        Some(&json!({"usuario_id": user.id, "roles_ids": [first_role]}))
+    );
+    assert_eq!(
+        roles_changed.7.as_ref().map(|value| &value.0),
+        Some(&json!({"usuario_id": user.id, "roles_ids": [replacement_role]}))
+    );
+    assert_eq!(
+        enabled.6.as_ref().map(|value| &value.0),
+        Some(&json!({"usuario_id": user.id, "activo": false}))
+    );
+    assert_eq!(
+        enabled.7.as_ref().map(|value| &value.0),
+        Some(&json!({"usuario_id": user.id, "activo": true}))
+    );
+    assert!(created.7.as_ref().is_some_and(|value| {
+        value.0.get("correo_electronico").is_none()
+            && value.0.get("sujeto_proveedor").is_none()
+            && value.0.get("token").is_none()
+    }));
+
+    let role_history: (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*)::bigint, COUNT(vigente_hasta)::bigint FROM public.usuarios_roles WHERE usuario_id = $1",
+    )
+    .bind(user.id)
+    .fetch_one(&fixture.db)
+    .await
+    .expect("user role history must be queryable");
+    assert_eq!(role_history, (2, 1));
+}
+
+#[tokio::test]
+async fn role_creation_activity_and_permission_changes_append_safe_administrative_audit_events() {
+    let fixture = admin_fixture().await;
+    let role = access_administration::create_role(
+        &fixture.db,
+        &fixture.context,
+        &CreateRoleRequest {
+            nombre: format!("Rol auditado {}", Uuid::new_v4()),
+            descripcion: Some("Descripción que no se audita".to_owned()),
+            permisos: vec![permission_codes::CONSOLA_TECNICA_VER.to_owned()],
+        },
+    )
+    .await
+    .expect("role must create");
+    access_administration::update_role(
+        &fixture.db,
+        &fixture.context,
+        role.id,
+        &UpdateRoleRequest {
+            nombre: None,
+            descripcion: None,
+            activo: Some(false),
+            permisos: Some(vec![CONFIGURATION_VIEW_PERMISSION.to_owned()]),
+        },
+    )
+    .await
+    .expect("role activity and permissions must update");
+    access_administration::update_role(
+        &fixture.db,
+        &fixture.context,
+        role.id,
+        &UpdateRoleRequest {
+            nombre: None,
+            descripcion: None,
+            activo: Some(true),
+            permisos: None,
+        },
+    )
+    .await
+    .expect("role must re-enable");
+
+    let events = audit_events_for_entity(&fixture, role.id).await;
+    assert_eq!(events.len(), 4);
+    for event in &events {
+        assert_eq!(event.0, fixture.organization_id);
+        assert_eq!(event.1, "usuario");
+        assert_eq!(event.2, Some(fixture.administrator_user_id));
+        assert_eq!(event.4, "rol");
+        assert_eq!(event.5, Some(role.id));
+    }
+    let created = audit_event_by_action(&events, "rol.creado");
+    let disabled = audit_event_by_action(&events, "rol.deshabilitado");
+    let permissions_changed = audit_event_by_action(&events, "rol.permisos_actualizados");
+    let enabled = audit_event_by_action(&events, "rol.habilitado");
+    assert_eq!(created.6, None);
+    assert_eq!(
+        created.7.as_ref().map(|value| &value.0),
+        Some(&json!({
+            "rol_id": role.id,
+            "activo": true,
+            "permisos": [permission_codes::CONSOLA_TECNICA_VER],
+        }))
+    );
+    assert_eq!(
+        disabled.6.as_ref().map(|value| &value.0),
+        Some(&json!({"rol_id": role.id, "activo": true}))
+    );
+    assert_eq!(
+        disabled.7.as_ref().map(|value| &value.0),
+        Some(&json!({"rol_id": role.id, "activo": false}))
+    );
+    assert_eq!(
+        permissions_changed.6.as_ref().map(|value| &value.0),
+        Some(&json!({
+            "rol_id": role.id,
+            "permisos": [permission_codes::CONSOLA_TECNICA_VER],
+        }))
+    );
+    assert_eq!(
+        permissions_changed.7.as_ref().map(|value| &value.0),
+        Some(&json!({
+            "rol_id": role.id,
+            "permisos": [CONFIGURATION_VIEW_PERMISSION],
+        }))
+    );
+    assert_eq!(
+        enabled.6.as_ref().map(|value| &value.0),
+        Some(&json!({"rol_id": role.id, "activo": false}))
+    );
+    assert_eq!(
+        enabled.7.as_ref().map(|value| &value.0),
+        Some(&json!({"rol_id": role.id, "activo": true}))
+    );
+
+    let permission_history: (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*)::bigint, COUNT(vigente_hasta)::bigint FROM public.roles_permisos WHERE rol_id = $1",
+    )
+    .bind(role.id)
+    .fetch_one(&fixture.db)
+    .await
+    .expect("role permission history must be queryable");
+    assert_eq!(permission_history, (2, 1));
+}
+
+#[tokio::test]
 async fn external_success_followed_by_internal_failure_grants_no_agro_ops_access() {
     let fixture = admin_fixture().await;
     let other_organization: Uuid =
@@ -441,6 +691,14 @@ async fn external_success_followed_by_internal_failure_grants_no_agro_ops_access
         authorization::resolve_context(&fixture.db, subject).await,
         Err(authorization::ResolveAuthorizationError::PrincipalUnavailable)
     ));
+    let failed_creation_audits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM public.audit_events WHERE organizacion_id = $1 AND accion = 'usuario.creado'",
+    )
+    .bind(fixture.organization_id)
+    .fetch_one(&fixture.db)
+    .await
+    .expect("failed creation audit count must be queryable");
+    assert_eq!(failed_creation_audits, 0);
 
     let retried = access_administration::create_or_enable_user(
         &fixture.db,
@@ -467,6 +725,57 @@ async fn external_success_followed_by_internal_failure_grants_no_agro_ops_access
     .await
     .expect("retried internal state must be queryable");
     assert_eq!(internal_state, (1, 1, 0));
+}
+
+#[tokio::test]
+async fn audit_insert_failure_rolls_back_the_internal_user_creation() {
+    let fixture = admin_fixture().await;
+    sqlx::query(AssertSqlSafe(format!(
+        "ALTER TABLE public.audit_events ADD CONSTRAINT ck_audit_events_test_actor_rejected CHECK (actor_usuario_id IS DISTINCT FROM '{}'::uuid)",
+        fixture.administrator_user_id,
+    )))
+    .execute(&fixture.db)
+    .await
+    .expect("test audit constraint must install");
+
+    let subject = Uuid::new_v4();
+    let result = access_administration::create_or_enable_user(
+        &fixture.db,
+        successful_external_admin(subject).as_ref(),
+        &fixture.context,
+        &CreateUserRequest {
+            correo_electronico: "rollback@example.com".to_owned(),
+            nombre_completo: "Usuario revertido".to_owned(),
+            roles_ids: vec![],
+        },
+    )
+    .await;
+
+    sqlx::query(
+        "ALTER TABLE public.audit_events DROP CONSTRAINT ck_audit_events_test_actor_rejected",
+    )
+    .execute(&fixture.db)
+    .await
+    .expect("test audit constraint must remove");
+
+    assert!(matches!(
+        result,
+        Err(AccessAdministrationError::DatabaseUnavailable)
+    ));
+    let internal_state: (i64, i64, i64) = sqlx::query_as(
+        r#"
+        SELECT
+            (SELECT COUNT(*)::bigint FROM public.usuarios WHERE organizacion_id = $1 AND nombre_completo = 'Usuario revertido'),
+            (SELECT COUNT(*)::bigint FROM public.identidades_autenticacion_externas WHERE sujeto_proveedor = $2),
+            (SELECT COUNT(*)::bigint FROM public.audit_events WHERE organizacion_id = $1 AND accion = 'usuario.creado')
+        "#,
+    )
+    .bind(fixture.organization_id)
+    .bind(subject)
+    .fetch_one(&fixture.db)
+    .await
+    .expect("rolled-back internal state must be queryable");
+    assert_eq!(internal_state, (0, 0, 0));
 }
 
 #[tokio::test]
@@ -750,6 +1059,14 @@ async fn sole_administrator_cannot_be_disabled() {
 
     assert_eq!(error, AccessAdministrationError::Conflict);
     assert_eq!(effective_administrator_count(&fixture).await, 1);
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM public.audit_events WHERE organizacion_id = $1 AND accion = 'usuario.deshabilitado'",
+    )
+    .bind(fixture.organization_id)
+    .fetch_one(&fixture.db)
+    .await
+    .expect("last-administrator audit count must be queryable");
+    assert_eq!(audit_count, 0);
     let active: bool = sqlx::query_scalar("SELECT activo FROM public.usuarios WHERE id = $1")
         .bind(fixture.administrator_user_id)
         .fetch_one(&fixture.db)

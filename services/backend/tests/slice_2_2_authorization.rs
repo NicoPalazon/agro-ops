@@ -282,6 +282,11 @@ fn subject_state(db: PgPool, subject: impl ToString) -> AppState {
         external_identity_admin: Arc::new(
             agro_ops_backend::supabase_admin::UnavailableExternalIdentityAdmin,
         ),
+        document_storage: Arc::new(agro_ops_backend::documents::UnavailableDocumentStorage),
+        document_settings: agro_ops_backend::documents::DocumentSettings::new(
+            "documentos_privados",
+            1024,
+        ),
     }
 }
 
@@ -293,6 +298,11 @@ fn unavailable_verifier_state(db: PgPool) -> AppState {
         }),
         external_identity_admin: Arc::new(
             agro_ops_backend::supabase_admin::UnavailableExternalIdentityAdmin,
+        ),
+        document_storage: Arc::new(agro_ops_backend::documents::UnavailableDocumentStorage),
+        document_settings: agro_ops_backend::documents::DocumentSettings::new(
+            "documentos_privados",
+            1024,
         ),
     }
 }

@@ -2,7 +2,7 @@ use agro_ops_backend::{
     config::RuntimeConfig,
     shutdown::shutdown_signal,
     telemetry::init_tracing,
-    worker::{Worker, walking_skeleton_test_job},
+    worker::{JobDispatcher, Worker, WorkerSettings, walking_skeleton_test_job},
 };
 use sqlx::postgres::PgPoolOptions;
 use tokio::sync::mpsc;
@@ -34,7 +34,16 @@ async fn main() {
             );
             std::process::exit(1);
         });
-    let worker = Worker::new(config.worker_heartbeat_interval(), db);
+    let worker = Worker::new(
+        WorkerSettings {
+            heartbeat_interval: config.worker_heartbeat_interval(),
+            poll_interval: config.job_poll_interval(),
+            claim_batch_size: config.job_claim_batch_size(),
+            stale_threshold: config.job_stale_threshold(),
+        },
+        db,
+        JobDispatcher::empty(),
+    );
     let (job_sender, job_receiver) = mpsc::channel(1);
 
     if std::env::args().any(|argument| argument == "--test-job-once") {

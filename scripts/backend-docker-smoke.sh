@@ -347,6 +347,8 @@ docker run --detach --name "${api_container}" --network "${network_name}" \
     --env "SUPABASE_PUBLISHABLE_KEY=${smoke_publishable_key}" \
     --env "SUPABASE_SECRET_KEY=smoke-secret-key" \
     --env "SUPABASE_INVITE_REDIRECT_URL=http://localhost:3000/aceptar-invitacion" \
+    --env "SUPABASE_STORAGE_BUCKET=documentos_privados" \
+    --env "DOCUMENT_MAX_UPLOAD_BYTES=10485760" \
     "${image_tag}" api >/dev/null
 containers+=("${api_container}")
 

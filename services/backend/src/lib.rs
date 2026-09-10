@@ -2,11 +2,11 @@ use std::{sync::Arc, time::Instant};
 
 use axum::{
     Json, Router,
-    extract::{MatchedPath, Path, Request, State},
+    extract::{DefaultBodyLimit, MatchedPath, Multipart, Path, Query, Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use serde::Serialize;
 use sqlx::PgPool;
@@ -16,12 +16,19 @@ use uuid::Uuid;
 
 pub mod access_administration;
 pub mod access_provisioning;
+pub mod audit;
 pub mod auth;
 pub mod authorization;
 pub mod config;
+pub mod documents;
+pub mod external_references;
+pub mod idempotency;
+pub mod jobs;
+pub mod outbox;
 pub mod service_heartbeats;
 pub mod shutdown;
 pub mod supabase_admin;
+pub mod supabase_storage;
 pub mod telemetry;
 pub mod worker;
 
@@ -32,6 +39,8 @@ pub struct AppState {
     pub db: PgPool,
     pub auth: Arc<dyn auth::AccessTokenVerifier>,
     pub external_identity_admin: Arc<dyn supabase_admin::ExternalIdentityAdmin>,
+    pub document_storage: Arc<dyn documents::DocumentStorage>,
+    pub document_settings: documents::DocumentSettings,
 }
 
 const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
@@ -98,6 +107,148 @@ impl IntoResponse for RequestAccessError {
 enum AdministrationRequestError {
     Access(RequestAccessError),
     Administration(access_administration::AccessAdministrationError),
+}
+
+#[derive(Debug)]
+enum JobsRequestError {
+    Access(RequestAccessError),
+    Database(sqlx::Error),
+}
+
+#[derive(Debug)]
+enum OutboxRequestError {
+    Access(RequestAccessError),
+    Store(outbox::OutboxStoreError),
+}
+
+#[derive(Debug)]
+enum AuditRequestError {
+    Access(RequestAccessError),
+    Database(sqlx::Error),
+}
+
+#[derive(Debug)]
+enum IdempotencyRequestError {
+    Access(RequestAccessError),
+    Database(sqlx::Error),
+}
+
+#[derive(Debug)]
+enum DocumentRequestError {
+    Access(RequestAccessError),
+    BadRequest,
+    PayloadTooLarge,
+    NotFound,
+    StorageUnavailable,
+    Database(sqlx::Error),
+}
+
+impl From<RequestAccessError> for DocumentRequestError {
+    fn from(error: RequestAccessError) -> Self {
+        Self::Access(error)
+    }
+}
+
+impl IntoResponse for DocumentRequestError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Access(error) => error.into_response(),
+            Self::BadRequest => (
+                StatusCode::BAD_REQUEST,
+                Json(ApiErrorResponse {
+                    error: "documento_invalido",
+                    mensaje: "El archivo enviado no es válido.",
+                }),
+            )
+                .into_response(),
+            Self::PayloadTooLarge => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(ApiErrorResponse {
+                    error: "documento_demasiado_grande",
+                    mensaje: "El archivo supera el tamaño máximo permitido.",
+                }),
+            )
+                .into_response(),
+            Self::NotFound => StatusCode::NOT_FOUND.into_response(),
+            Self::StorageUnavailable => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            Self::Database(error) => {
+                warn!(%error, "document metadata operation failed");
+                StatusCode::SERVICE_UNAVAILABLE.into_response()
+            }
+        }
+    }
+}
+
+impl From<RequestAccessError> for OutboxRequestError {
+    fn from(error: RequestAccessError) -> Self {
+        Self::Access(error)
+    }
+}
+
+impl IntoResponse for OutboxRequestError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Access(error) => error.into_response(),
+            Self::Store(error) => {
+                warn!(%error, "failed to read outbox diagnostics");
+                StatusCode::SERVICE_UNAVAILABLE.into_response()
+            }
+        }
+    }
+}
+
+impl From<RequestAccessError> for JobsRequestError {
+    fn from(error: RequestAccessError) -> Self {
+        Self::Access(error)
+    }
+}
+
+impl IntoResponse for JobsRequestError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Access(error) => error.into_response(),
+            Self::Database(error) => {
+                warn!(%error, "failed to read job diagnostics");
+                StatusCode::SERVICE_UNAVAILABLE.into_response()
+            }
+        }
+    }
+}
+
+impl From<RequestAccessError> for AuditRequestError {
+    fn from(error: RequestAccessError) -> Self {
+        Self::Access(error)
+    }
+}
+
+impl IntoResponse for AuditRequestError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Access(error) => error.into_response(),
+            Self::Database(error) => {
+                warn!(%error, "failed to read audit diagnostics");
+                StatusCode::SERVICE_UNAVAILABLE.into_response()
+            }
+        }
+    }
+}
+
+impl From<RequestAccessError> for IdempotencyRequestError {
+    fn from(error: RequestAccessError) -> Self {
+        Self::Access(error)
+    }
+}
+
+impl IntoResponse for IdempotencyRequestError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Access(error) => error.into_response(),
+            Self::Database(error) => {
+                warn!(%error, "failed to read idempotency diagnostics");
+                StatusCode::SERVICE_UNAVAILABLE.into_response()
+            }
+        }
+    }
 }
 
 impl From<RequestAccessError> for AdministrationRequestError {
@@ -186,14 +337,22 @@ impl Modify for SupabaseBearerSecurity {
         version = env!("CARGO_PKG_VERSION"),
         description = "HTTP contract for Agro Ops backend health and system status endpoints."
     ),
-    paths(health, ready, version, me, internal_worker_status, internal_system_status),
-    components(schemas(StatusResponse, VersionResponse, MeResponse, SystemStatusResponse, ServiceStatus, ServiceStatusReport)),
+    paths(health, ready, version, me, internal_worker_status, internal_system_status, internal_jobs, internal_outbox, internal_audit, internal_idempotencia, create_document, document_metadata, document_download),
+    components(schemas(StatusResponse, VersionResponse, MeResponse, SystemStatusResponse, ServiceStatus, ServiceStatusReport, jobs::JobState, jobs::JobDiagnostic, jobs::JobsDiagnosticsResponse, outbox::OutboxDiagnostic, outbox::OutboxDiagnosticsResponse, audit::AuditDiagnostic, audit::AuditDiagnosticsResponse, idempotency::IdempotencyDiagnostic, idempotency::IdempotencyDiagnosticsResponse, documents::DocumentMetadata, documents::CreatedDocument, documents::DocumentDownloadResponse)),
     modifiers(&SupabaseBearerSecurity)
 )]
 struct ApiDoc;
 
 pub fn app(state: AppState) -> Router {
+    let document_body_limit = state
+        .document_settings
+        .max_upload_bytes()
+        .saturating_add(128 * 1024);
     Router::new()
+        .route("/documentos", post(create_document))
+        .route("/documentos/{document_id}", get(document_metadata))
+        .route("/documentos/{document_id}/descarga", get(document_download))
+        .route_layer(DefaultBodyLimit::max(document_body_limit))
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/version", get(version))
@@ -216,6 +375,10 @@ pub fn app(state: AppState) -> Router {
         )
         .route("/internal/worker/status", get(internal_worker_status))
         .route("/internal/system-status", get(internal_system_status))
+        .route("/internal/jobs", get(internal_jobs))
+        .route("/internal/outbox", get(internal_outbox))
+        .route("/internal/audit", get(internal_audit))
+        .route("/internal/idempotencia", get(internal_idempotencia))
         .route("/openapi.json", get(openapi_json))
         .layer(middleware::from_fn(request_tracing))
         .with_state(state)
@@ -593,6 +756,290 @@ async fn internal_system_status(
     }))
 }
 
+/// Lists bounded, payload-free PostgreSQL queue diagnostics.
+#[utoipa::path(
+    get,
+    path = "/internal/jobs",
+    params(jobs::JobDiagnosticsQuery),
+    security(("supabaseBearer" = [])),
+    responses(
+        (status = 200, description = "Bounded job diagnostics without payloads.", body = jobs::JobsDiagnosticsResponse),
+        (status = 401, description = "A valid Supabase user access token is required."),
+        (status = 403, description = "The authenticated actor does not have access to the Internal Console."),
+        (status = 503, description = "Authorization or job diagnostics are unavailable.")
+    )
+)]
+async fn internal_jobs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<jobs::JobDiagnosticsQuery>,
+) -> Result<Json<jobs::JobsDiagnosticsResponse>, JobsRequestError> {
+    let _authorization_context = authorize_request(
+        &state,
+        &headers,
+        authorization::permission_codes::CONSOLA_TECNICA_VER,
+    )
+    .await?;
+
+    jobs::list_diagnostics(&state.db, &query)
+        .await
+        .map(Json)
+        .map_err(|error| match error {
+            jobs::JobStoreError::Database(error) => JobsRequestError::Database(error),
+            jobs::JobStoreError::InvalidBatchSize | jobs::JobStoreError::InvalidStaleThreshold => {
+                unreachable!("diagnostic bounds are normalized before querying")
+            }
+        })
+}
+
+/// Lists bounded, payload-free transactional outbox diagnostics.
+#[utoipa::path(
+    get,
+    path = "/internal/outbox",
+    params(outbox::OutboxDiagnosticsQuery),
+    security(("supabaseBearer" = [])),
+    responses(
+        (status = 200, description = "Bounded outbox and linked delivery job diagnostics without payloads.", body = outbox::OutboxDiagnosticsResponse),
+        (status = 401, description = "A valid Supabase user access token is required."),
+        (status = 403, description = "The authenticated actor does not have access to the Internal Console."),
+        (status = 503, description = "Authorization or outbox diagnostics are unavailable.")
+    )
+)]
+async fn internal_outbox(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<outbox::OutboxDiagnosticsQuery>,
+) -> Result<Json<outbox::OutboxDiagnosticsResponse>, OutboxRequestError> {
+    let _authorization_context = authorize_request(
+        &state,
+        &headers,
+        authorization::permission_codes::CONSOLA_TECNICA_VER,
+    )
+    .await?;
+
+    outbox::list_diagnostics(&state.db, &query)
+        .await
+        .map(Json)
+        .map_err(OutboxRequestError::Store)
+}
+
+/// Lists bounded, organization-scoped audit metadata without snapshots.
+#[utoipa::path(
+    get,
+    path = "/internal/audit",
+    params(audit::AuditDiagnosticsQuery),
+    security(("supabaseBearer" = [])),
+    responses(
+        (status = 200, description = "Bounded organization-scoped audit metadata without snapshots.", body = audit::AuditDiagnosticsResponse),
+        (status = 401, description = "A valid Supabase user access token is required."),
+        (status = 403, description = "The authenticated actor does not have access to the Internal Console."),
+        (status = 503, description = "Authorization or audit diagnostics are unavailable.")
+    )
+)]
+async fn internal_audit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<audit::AuditDiagnosticsQuery>,
+) -> Result<Json<audit::AuditDiagnosticsResponse>, AuditRequestError> {
+    let authorization_context = authorize_request(
+        &state,
+        &headers,
+        authorization::permission_codes::CONSOLA_TECNICA_VER,
+    )
+    .await?;
+
+    audit::list_diagnostics(&state.db, authorization_context.organization_id, &query)
+        .await
+        .map(Json)
+        .map_err(AuditRequestError::Database)
+}
+
+/// Lists bounded, organization-scoped idempotency metadata without replay results.
+#[utoipa::path(
+    get,
+    path = "/internal/idempotencia",
+    params(idempotency::IdempotencyDiagnosticsQuery),
+    security(("supabaseBearer" = [])),
+    responses(
+        (status = 200, description = "Bounded organization-scoped idempotency metadata without replay results.", body = idempotency::IdempotencyDiagnosticsResponse),
+        (status = 401, description = "A valid Supabase user access token is required."),
+        (status = 403, description = "The authenticated actor does not have access to the Internal Console."),
+        (status = 503, description = "Authorization or idempotency diagnostics are unavailable.")
+    )
+)]
+async fn internal_idempotencia(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<idempotency::IdempotencyDiagnosticsQuery>,
+) -> Result<Json<idempotency::IdempotencyDiagnosticsResponse>, IdempotencyRequestError> {
+    let authorization_context = authorize_request(
+        &state,
+        &headers,
+        authorization::permission_codes::CONSOLA_TECNICA_VER,
+    )
+    .await?;
+
+    idempotency::list_diagnostics(&state.db, authorization_context.organization_id, &query)
+        .await
+        .map(Json)
+        .map_err(IdempotencyRequestError::Database)
+}
+
+/// Stores a private document for the authenticated actor's organization.
+#[utoipa::path(
+    post,
+    path = "/documentos",
+    request_body(content = String, content_type = "multipart/form-data", description = "One `archivo` file field."),
+    security(("supabaseBearer" = [])),
+    responses(
+        (status = 201, description = "Private document metadata was created.", body = documents::CreatedDocument),
+        (status = 400, description = "The multipart file is invalid."),
+        (status = 401, description = "A valid Supabase user access token is required."),
+        (status = 403, description = "The authenticated identity is not an active Agro Ops user."),
+        (status = 413, description = "The file exceeds the configured maximum size."),
+        (status = 503, description = "Storage or metadata persistence is unavailable.")
+    )
+)]
+async fn create_document(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Result<(StatusCode, Json<documents::CreatedDocument>), DocumentRequestError> {
+    let context = resolve_request_context(&state, &headers).await?;
+    let upload =
+        read_document_upload(&mut multipart, state.document_settings.max_upload_bytes()).await?;
+    let created = documents::create(
+        &state.db,
+        &state.document_storage,
+        &state.document_settings,
+        &context,
+        upload,
+    )
+    .await
+    .map_err(map_document_error)?;
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
+/// Returns safe metadata for a private document in the caller's organization.
+#[utoipa::path(
+    get,
+    path = "/documentos/{document_id}",
+    params(("document_id" = String, Path, description = "Documento UUID")),
+    security(("supabaseBearer" = [])),
+    responses(
+        (status = 200, description = "Safe document metadata.", body = documents::DocumentMetadata),
+        (status = 401, description = "A valid Supabase user access token is required."),
+        (status = 404, description = "The document is not in the caller organization."),
+        (status = 503, description = "Metadata storage is unavailable.")
+    )
+)]
+async fn document_metadata(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(document_id): Path<Uuid>,
+) -> Result<Json<documents::DocumentMetadata>, DocumentRequestError> {
+    let context = resolve_request_context(&state, &headers).await?;
+    documents::metadata(&state.db, context.organization_id, document_id)
+        .await
+        .map(Json)
+        .map_err(map_document_error)
+}
+
+/// Creates short-lived private download access for a document in the caller's organization.
+#[utoipa::path(
+    get,
+    path = "/documentos/{document_id}/descarga",
+    params(("document_id" = String, Path, description = "Documento UUID")),
+    security(("supabaseBearer" = [])),
+    responses(
+        (status = 200, description = "Short-lived private download access.", body = documents::DocumentDownloadResponse),
+        (status = 401, description = "A valid Supabase user access token is required."),
+        (status = 404, description = "The document is not in the caller organization."),
+        (status = 503, description = "Private Storage is unavailable.")
+    )
+)]
+async fn document_download(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(document_id): Path<Uuid>,
+) -> Result<Json<documents::DocumentDownloadResponse>, DocumentRequestError> {
+    let context = resolve_request_context(&state, &headers).await?;
+    documents::download_access(
+        &state.db,
+        &state.document_storage,
+        context.organization_id,
+        document_id,
+    )
+    .await
+    .map(Json)
+    .map_err(map_document_error)
+}
+
+async fn read_document_upload(
+    multipart: &mut Multipart,
+    maximum_size: usize,
+) -> Result<documents::DocumentUpload, DocumentRequestError> {
+    let upload = {
+        let field = multipart
+            .next_field()
+            .await
+            .map_err(|_| DocumentRequestError::BadRequest)?
+            .ok_or(DocumentRequestError::BadRequest)?;
+        if field.name() != Some("archivo") {
+            return Err(DocumentRequestError::BadRequest);
+        }
+        let filename = field
+            .file_name()
+            .map(str::to_owned)
+            .ok_or(DocumentRequestError::BadRequest)?;
+        let mime_type = field
+            .content_type()
+            .map(str::to_owned)
+            .unwrap_or_else(|| "application/octet-stream".to_owned());
+        let mut collector = documents::DocumentUploadCollector::new(
+            filename,
+            mime_type,
+            maximum_size,
+        )
+        .map_err(|error| match error {
+            documents::DocumentUploadError::TooLarge => DocumentRequestError::PayloadTooLarge,
+            _ => DocumentRequestError::BadRequest,
+        })?;
+        let mut field = field;
+        while let Some(chunk) = field
+            .chunk()
+            .await
+            .map_err(|_| DocumentRequestError::BadRequest)?
+        {
+            collector.push_chunk(&chunk).map_err(|error| match error {
+                documents::DocumentUploadError::TooLarge => DocumentRequestError::PayloadTooLarge,
+                _ => DocumentRequestError::BadRequest,
+            })?;
+        }
+        collector.finish().map_err(|error| match error {
+            documents::DocumentUploadError::TooLarge => DocumentRequestError::PayloadTooLarge,
+            _ => DocumentRequestError::BadRequest,
+        })?
+    };
+    if multipart
+        .next_field()
+        .await
+        .map_err(|_| DocumentRequestError::BadRequest)?
+        .is_some()
+    {
+        return Err(DocumentRequestError::BadRequest);
+    }
+    Ok(upload)
+}
+
+fn map_document_error(error: documents::DocumentError) -> DocumentRequestError {
+    match error {
+        documents::DocumentError::NotFound => DocumentRequestError::NotFound,
+        documents::DocumentError::StorageUnavailable => DocumentRequestError::StorageUnavailable,
+        documents::DocumentError::Database(error) => DocumentRequestError::Database(error),
+    }
+}
+
 async fn authenticate_request(
     state: &AppState,
     headers: &HeaderMap,
@@ -763,6 +1210,8 @@ mod tests {
             db,
             auth: test_auth(),
             external_identity_admin: Arc::new(supabase_admin::UnavailableExternalIdentityAdmin),
+            document_storage: Arc::new(documents::UnavailableDocumentStorage),
+            document_settings: documents::DocumentSettings::new("documentos_privados", 1024),
         }
     }
 
@@ -776,6 +1225,8 @@ mod tests {
             db,
             auth: test_auth(),
             external_identity_admin: Arc::new(supabase_admin::UnavailableExternalIdentityAdmin),
+            document_storage: Arc::new(documents::UnavailableDocumentStorage),
+            document_settings: documents::DocumentSettings::new("documentos_privados", 1024),
         }
     }
 
@@ -944,6 +1395,10 @@ mod tests {
             "/me",
             "/internal/worker/status",
             "/internal/system-status",
+            "/internal/jobs",
+            "/internal/outbox",
+            "/internal/audit",
+            "/internal/idempotencia",
         ] {
             assert!(document["paths"][path]["get"].is_object());
         }
@@ -975,7 +1430,14 @@ mod tests {
             document["paths"]["/internal/system-status"]["get"]["security"][0]["supabaseBearer"],
             serde_json::json!([])
         );
-        for path in ["/internal/worker/status", "/internal/system-status"] {
+        for path in [
+            "/internal/worker/status",
+            "/internal/system-status",
+            "/internal/jobs",
+            "/internal/outbox",
+            "/internal/audit",
+            "/internal/idempotencia",
+        ] {
             assert!(document["paths"][path]["get"]["responses"]["401"].is_object());
             assert!(document["paths"][path]["get"]["responses"]["403"].is_object());
             assert!(document["paths"][path]["get"]["responses"]["503"].is_object());
@@ -1373,6 +1835,559 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn internal_jobs_requires_a_valid_access_token() {
+        let response = app(unavailable_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/jobs")
+                    .body(Body::empty())
+                    .expect("jobs request must be valid"),
+            )
+            .await
+            .expect("jobs request must complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn internal_jobs_rejects_authenticated_users_without_technical_permission() {
+        let state = available_state().await;
+        let subject = Uuid::new_v4();
+        provision_internal_access(
+            &state.db,
+            subject,
+            authorization::permission_codes::CONFIGURACION_ADMINISTRAR,
+        )
+        .await;
+
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/jobs")
+                    .header("authorization", format!("Bearer {}", valid_token(subject)))
+                    .body(Body::empty())
+                    .expect("jobs request must be valid"),
+            )
+            .await
+            .expect("jobs request must complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn internal_jobs_returns_bounded_filtered_metadata_without_payloads_or_secrets() {
+        let state = available_state().await;
+        let subject = Uuid::new_v4();
+        provision_internal_console_access(&state.db, subject).await;
+        let job_id = Uuid::new_v4();
+        let diagnostic_job_type = "test.internal_jobs_diagnostic";
+        let secret = "private-access-token-must-not-leak";
+
+        // Remove only fixtures owned by this test. Jobs are otherwise shared
+        // across the suite and the endpoint intentionally has global scope.
+        sqlx::query(
+            "DELETE FROM public.jobs WHERE tipo IN ('test.internal_diagnostic', 'test.internal_jobs_diagnostic')",
+        )
+        .execute(&state.db)
+        .await
+        .expect("prior jobs diagnostic fixtures must be removable");
+        sqlx::query(
+            r#"
+            INSERT INTO public.jobs (
+                id, tipo, estado, payload, intentos, max_intentos,
+                next_attempt_at, actualizado_en, ultimo_error
+            )
+            VALUES (
+                $1, $2, 'agotado',
+                jsonb_build_object('authorization', $3::text), 1, 1,
+                statement_timestamp(), TIMESTAMPTZ '9999-12-31 23:59:59+00', 'Resumen seguro'
+            )
+            "#,
+        )
+        .bind(job_id)
+        .bind(diagnostic_job_type)
+        .bind(secret)
+        .execute(&state.db)
+        .await
+        .expect("diagnostic test job must insert");
+
+        // Internal Jobs intentionally offers only state and bound filters. A
+        // terminal fixture timestamp makes this owned row the deterministic
+        // newest match without assuming the shared database has no other jobs.
+
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/jobs?estado=agotado&limite=1")
+                    .header("authorization", format!("Bearer {}", valid_token(subject)))
+                    .body(Body::empty())
+                    .expect("jobs request must be valid"),
+            )
+            .await
+            .expect("jobs request must complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let raw_body = response_body(response).await;
+        assert!(!raw_body.contains(secret));
+        assert!(!raw_body.contains("payload"));
+        assert!(!raw_body.contains("authorization"));
+        let body: serde_json::Value =
+            serde_json::from_str(&raw_body).expect("jobs response must be valid JSON");
+        let jobs = body["jobs"].as_array().expect("jobs must be an array");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0]["id"], job_id.to_string());
+        assert_eq!(jobs[0]["tipo"], diagnostic_job_type);
+        assert_eq!(jobs[0]["estado"], "agotado");
+        assert_eq!(jobs[0]["intentos"], 1);
+        assert_eq!(jobs[0]["max_intentos"], 1);
+        assert_eq!(jobs[0]["ultimo_error"], "Resumen seguro");
+        assert!(jobs[0].get("payload").is_none());
+        assert!(jobs[0].get("organizacion_id").is_none());
+        assert!(jobs[0].get("credentials").is_none());
+        assert!(jobs[0]["bloqueado_por"].is_null());
+    }
+
+    #[tokio::test]
+    async fn internal_outbox_requires_authentication_and_technical_permission() {
+        let response = app(unavailable_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/outbox")
+                    .body(Body::empty())
+                    .expect("outbox request must be valid"),
+            )
+            .await
+            .expect("outbox request must complete");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let state = available_state().await;
+        let subject = Uuid::new_v4();
+        provision_internal_access(
+            &state.db,
+            subject,
+            authorization::permission_codes::CONFIGURACION_ADMINISTRAR,
+        )
+        .await;
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/outbox")
+                    .header("authorization", format!("Bearer {}", valid_token(subject)))
+                    .body(Body::empty())
+                    .expect("outbox request must be valid"),
+            )
+            .await
+            .expect("outbox request must complete");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn internal_outbox_joins_filters_and_bounds_safe_metadata_without_payloads() {
+        let state = available_state().await;
+        let subject = Uuid::new_v4();
+        provision_internal_console_access(&state.db, subject).await;
+        let destination = format!("diagnostic_{}", &Uuid::new_v4().simple().to_string()[..12]);
+        let secret = "private-outbox-payload-secret";
+        let mut transaction = state.db.begin().await.expect("transaction must begin");
+        let recorded = outbox::record(
+            &mut transaction,
+            outbox::NewOutboxEvent {
+                organization_id: None,
+                destination: outbox::OutboxDestination::new(&destination)
+                    .expect("destination must be canonical"),
+                event_type: outbox::OutboxEventType::new("test.internal_diagnostic")
+                    .expect("event type must be canonical"),
+                entity_type: Some(
+                    outbox::OutboxEntityType::new("test.entity")
+                        .expect("entity type must be canonical"),
+                ),
+                entity_id: Some(Uuid::new_v4()),
+                reference: Some("OUTBOX-DIAGNOSTIC".to_owned()),
+                idempotency_key: outbox::IdempotencyKey::new(format!(
+                    "diagnostic-{}",
+                    Uuid::new_v4()
+                ))
+                .expect("idempotency key must be valid"),
+                payload: serde_json::json!({"authorization": secret}),
+                delivery_max_attempts: 1,
+                delivery_next_attempt_at: time::OffsetDateTime::now_utc(),
+            },
+        )
+        .await
+        .expect("diagnostic event must record");
+        transaction.commit().await.expect("transaction must commit");
+
+        let worker_id = Uuid::new_v4();
+        jobs::claim(
+            &state.db,
+            worker_id,
+            &[outbox::OutboxDestination::new(&destination)
+                .expect("destination must be canonical")
+                .delivery_job_type()],
+            1,
+        )
+        .await
+        .expect("diagnostic delivery must claim");
+        jobs::mark_failed(
+            &state.db,
+            recorded.job_id,
+            worker_id,
+            time::OffsetDateTime::now_utc(),
+            &jobs::SafeErrorSummary::new("Resumen seguro").expect("error summary must be safe"),
+        )
+        .await
+        .expect("diagnostic delivery must exhaust");
+
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/internal/outbox?estado=agotado&destino={destination}&evento_tipo=test.internal_diagnostic&limite=1"
+                    ))
+                    .header("authorization", format!("Bearer {}", valid_token(subject)))
+                    .body(Body::empty())
+                    .expect("outbox request must be valid"),
+            )
+            .await
+            .expect("outbox request must complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let raw_body = response_body(response).await;
+        assert!(!raw_body.contains(secret));
+        assert!(!raw_body.contains("payload"));
+        assert!(!raw_body.contains("authorization"));
+        assert!(!raw_body.contains("credentials"));
+        let body: serde_json::Value =
+            serde_json::from_str(&raw_body).expect("outbox response must be valid JSON");
+        let events = body["eventos"]
+            .as_array()
+            .expect("eventos must be an array");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["id"], recorded.event_id.to_string());
+        assert_eq!(events[0]["destino"], destination);
+        assert_eq!(events[0]["evento_tipo"], "test.internal_diagnostic");
+        assert_eq!(events[0]["estado"], "agotado");
+        assert_eq!(events[0]["intentos"], 1);
+        assert_eq!(events[0]["max_intentos"], 1);
+        assert_eq!(events[0]["ultimo_error"], "Resumen seguro");
+        assert!(events[0].get("payload").is_none());
+    }
+
+    #[tokio::test]
+    async fn internal_audit_requires_authentication_and_technical_permission() {
+        let response = app(unavailable_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/audit")
+                    .body(Body::empty())
+                    .expect("audit request must be valid"),
+            )
+            .await
+            .expect("audit request must complete");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let state = available_state().await;
+        let subject = Uuid::new_v4();
+        provision_internal_access(
+            &state.db,
+            subject,
+            authorization::permission_codes::CONFIGURACION_ADMINISTRAR,
+        )
+        .await;
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/audit")
+                    .header("authorization", format!("Bearer {}", valid_token(subject)))
+                    .body(Body::empty())
+                    .expect("audit request must be valid"),
+            )
+            .await
+            .expect("audit request must complete");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn internal_audit_returns_bounded_filtered_organization_scoped_metadata() {
+        let state = available_state().await;
+        let subject = Uuid::new_v4();
+        provision_internal_console_access(&state.db, subject).await;
+        let (organization_id, actor_user_id): (Uuid, Uuid) = sqlx::query_as(
+            "SELECT u.organizacion_id, u.id FROM public.usuarios AS u INNER JOIN public.identidades_autenticacion_externas AS i ON i.usuario_id = u.id WHERE i.proveedor = 'supabase' AND i.sujeto_proveedor = $1",
+        )
+        .bind(subject)
+        .fetch_one(&state.db)
+        .await
+        .expect("technical actor must exist");
+        let older_id = Uuid::new_v4();
+        let newer_id = Uuid::new_v4();
+        let secret = "private-audit-snapshot-secret";
+        for (id, action, occurred_at) in [
+            (
+                older_id,
+                "diagnostico.anterior",
+                time::OffsetDateTime::now_utc() - time::Duration::minutes(2),
+            ),
+            (
+                newer_id,
+                "diagnostico.reciente",
+                time::OffsetDateTime::now_utc() - time::Duration::minutes(1),
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO public.audit_events (id, organizacion_id, actor_tipo, actor_usuario_id, accion, entidad_tipo, entidad_id, referencia, estado_anterior, estado_posterior, ocurrido_en) VALUES ($1, $2, 'usuario', $3, $4, 'diagnostico_entidad', $5, 'AUDIT-DIAGNOSTIC', jsonb_build_object('authorization', $6::text), jsonb_build_object('authorization', $6::text), $7)",
+            )
+            .bind(id)
+            .bind(organization_id)
+            .bind(actor_user_id)
+            .bind(action)
+            .bind(Uuid::new_v4())
+            .bind(secret)
+            .bind(occurred_at)
+            .execute(&state.db)
+            .await
+            .expect("audit diagnostic event must insert");
+        }
+
+        let other_subject = Uuid::new_v4();
+        provision_internal_console_access(&state.db, other_subject).await;
+        let (other_organization_id, other_actor_user_id): (Uuid, Uuid) = sqlx::query_as(
+            "SELECT u.organizacion_id, u.id FROM public.usuarios AS u INNER JOIN public.identidades_autenticacion_externas AS i ON i.usuario_id = u.id WHERE i.proveedor = 'supabase' AND i.sujeto_proveedor = $1",
+        )
+        .bind(other_subject)
+        .fetch_one(&state.db)
+        .await
+        .expect("other technical actor must exist");
+        sqlx::query(
+            "INSERT INTO public.audit_events (organizacion_id, actor_tipo, actor_usuario_id, accion, entidad_tipo) VALUES ($1, 'usuario', $2, 'diagnostico.reciente', 'diagnostico_entidad')",
+        )
+        .bind(other_organization_id)
+        .bind(other_actor_user_id)
+        .execute(&state.db)
+        .await
+        .expect("other organization audit event must insert");
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/audit?entidad_tipo=diagnostico_entidad&limite=50")
+                    .header("authorization", format!("Bearer {}", valid_token(subject)))
+                    .body(Body::empty())
+                    .expect("audit request must be valid"),
+            )
+            .await
+            .expect("audit request must complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let raw_body = response_body(response).await;
+        assert!(!raw_body.contains(secret));
+        assert!(!raw_body.contains("authorization"));
+        let body: serde_json::Value =
+            serde_json::from_str(&raw_body).expect("audit response must be valid JSON");
+        let events = body["eventos"]
+            .as_array()
+            .expect("eventos must be an array");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["id"], newer_id.to_string());
+        assert_eq!(events[1]["id"], older_id.to_string());
+        assert_eq!(events[0]["accion"], "diagnostico.reciente");
+        assert_eq!(events[0]["actor_usuario_id"], actor_user_id.to_string());
+        assert_eq!(events[0]["tiene_estado_anterior"], true);
+        assert_eq!(events[0]["tiene_estado_posterior"], true);
+        assert!(events[0].get("estado_anterior").is_none());
+        assert!(events[0].get("estado_posterior").is_none());
+        assert!(events[0].get("organizacion_id").is_none());
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/internal/audit?entidad_tipo=diagnostico_entidad&actor_usuario_id={actor_user_id}&limite=1"
+                    ))
+                    .header("authorization", format!("Bearer {}", valid_token(subject)))
+                    .body(Body::empty())
+                    .expect("bounded audit request must be valid"),
+            )
+            .await
+            .expect("bounded audit request must complete");
+        let body: serde_json::Value = serde_json::from_str(&response_body(response).await)
+            .expect("bounded audit response must be valid JSON");
+        assert_eq!(
+            body["eventos"]
+                .as_array()
+                .expect("eventos must be an array")
+                .len(),
+            1
+        );
+
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/audit?accion=diagnostico.anterior&limite=50")
+                    .header("authorization", format!("Bearer {}", valid_token(subject)))
+                    .body(Body::empty())
+                    .expect("filtered audit request must be valid"),
+            )
+            .await
+            .expect("filtered audit request must complete");
+        let body: serde_json::Value = serde_json::from_str(&response_body(response).await)
+            .expect("filtered audit response must be valid JSON");
+        let events = body["eventos"]
+            .as_array()
+            .expect("eventos must be an array");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["id"], older_id.to_string());
+    }
+
+    #[tokio::test]
+    async fn internal_idempotency_requires_authentication_and_technical_permission() {
+        let response = app(unavailable_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/idempotencia")
+                    .body(Body::empty())
+                    .expect("idempotency request must be valid"),
+            )
+            .await
+            .expect("idempotency request must complete");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let state = available_state().await;
+        let subject = Uuid::new_v4();
+        provision_internal_access(
+            &state.db,
+            subject,
+            authorization::permission_codes::CONFIGURACION_ADMINISTRAR,
+        )
+        .await;
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/idempotencia")
+                    .header("authorization", format!("Bearer {}", valid_token(subject)))
+                    .body(Body::empty())
+                    .expect("idempotency request must be valid"),
+            )
+            .await
+            .expect("idempotency request must complete");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn internal_idempotency_returns_bounded_filtered_organization_scoped_metadata() {
+        let state = available_state().await;
+        let subject = Uuid::new_v4();
+        provision_internal_console_access(&state.db, subject).await;
+        let organization_id: Uuid = sqlx::query_scalar(
+            "SELECT u.organizacion_id FROM public.usuarios AS u INNER JOIN public.identidades_autenticacion_externas AS i ON i.usuario_id = u.id WHERE i.proveedor = 'supabase' AND i.sujeto_proveedor = $1",
+        )
+        .bind(subject)
+        .fetch_one(&state.db)
+        .await
+        .expect("technical organization must exist");
+        let secret = "private-idempotency-result-secret";
+        let diagnostic_suffix = Uuid::new_v4().simple().to_string();
+        let operation = format!("diagnostico.comando_{diagnostic_suffix}");
+        let older_key = format!("diagnostic-old-key-{diagnostic_suffix}");
+        let newer_key = format!("diagnostic-new-key-{diagnostic_suffix}");
+        let global_key = format!("global-diagnostic-key-{diagnostic_suffix}");
+        let older_id = Uuid::new_v4();
+        let newer_id = Uuid::new_v4();
+        for (id, key, completed_at, fingerprint) in [
+            (
+                older_id,
+                older_key.as_str(),
+                time::OffsetDateTime::now_utc() - time::Duration::minutes(2),
+                vec![17_u8; 32],
+            ),
+            (
+                newer_id,
+                newer_key.as_str(),
+                time::OffsetDateTime::now_utc() - time::Duration::minutes(1),
+                vec![42_u8; 32],
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO public.idempotency_records (id, organizacion_id, operacion, idempotency_key, request_sha256, resultado, completado_en) VALUES ($1, $2, $3, $4, $5, jsonb_build_object('secret', $6::text), $7)",
+            )
+            .bind(id)
+            .bind(organization_id)
+            .bind(&operation)
+            .bind(key)
+            .bind(fingerprint)
+            .bind(secret)
+            .bind(completed_at)
+            .execute(&state.db)
+            .await
+            .expect("idempotency diagnostic record must insert");
+        }
+        sqlx::query(
+            "INSERT INTO public.idempotency_records (organizacion_id, operacion, idempotency_key, request_sha256, resultado) VALUES (NULL, $1, $2, $3, jsonb_build_object('secret', $4::text))",
+        )
+        .bind(&operation)
+        .bind(&global_key)
+        .bind(vec![99_u8; 32])
+        .bind(secret)
+        .execute(&state.db)
+        .await
+        .expect("global idempotency record must insert");
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/internal/idempotencia?operacion={operation}&limite=1"
+                    ))
+                    .header("authorization", format!("Bearer {}", valid_token(subject)))
+                    .body(Body::empty())
+                    .expect("idempotency request must be valid"),
+            )
+            .await
+            .expect("idempotency request must complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let raw_body = response_body(response).await;
+        assert!(!raw_body.contains(secret));
+        assert!(!raw_body.contains(&global_key));
+        let body: serde_json::Value =
+            serde_json::from_str(&raw_body).expect("idempotency response must be valid JSON");
+        let records = body["registros"]
+            .as_array()
+            .expect("registros must be an array");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["id"], newer_id.to_string());
+        assert_eq!(records[0]["request_sha256"], "2a".repeat(32));
+        assert!(
+            records[0]["resultado_bytes"]
+                .as_i64()
+                .is_some_and(|size| size > 0)
+        );
+        assert!(records[0].get("resultado").is_none());
+        assert!(records[0].get("organizacion_id").is_none());
+
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/internal/idempotencia?operacion={operation}&idempotency_key={older_key}&limite=50"
+                    ))
+                    .header("authorization", format!("Bearer {}", valid_token(subject)))
+                    .body(Body::empty())
+                    .expect("idempotency request must be valid"),
+            )
+            .await
+            .expect("idempotency key filter request must complete");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_body(response).await)
+            .expect("filtered idempotency response must be valid JSON");
+        let records = body["registros"]
+            .as_array()
+            .expect("registros must be an array");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["id"], older_id.to_string());
+    }
+
+    #[tokio::test]
     async fn openapi_document_is_not_public() {
         let response = app(unavailable_state())
             .oneshot(
@@ -1608,6 +2623,20 @@ mod tests {
         let state = available_state().await;
         let subject = Uuid::new_v4();
         provision_internal_console_access(&state.db, subject).await;
+        let caller_user_id: Uuid = sqlx::query_scalar(
+            "SELECT usuario_id FROM public.identidades_autenticacion_externas WHERE proveedor = 'supabase' AND sujeto_proveedor = $1",
+        )
+        .bind(subject)
+        .fetch_one(&state.db)
+        .await
+        .expect("unauthorized caller must be queryable");
+        let audits_before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM public.audit_events WHERE actor_usuario_id = $1",
+        )
+        .bind(caller_user_id)
+        .fetch_one(&state.db)
+        .await
+        .expect("audit count must be queryable");
 
         for (method, uri, body) in [
             (Method::GET, "/configuracion/usuarios", ""),
@@ -1648,5 +2677,13 @@ mod tests {
 
             assert_eq!(response.status(), StatusCode::FORBIDDEN);
         }
+        let audits_after: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM public.audit_events WHERE actor_usuario_id = $1",
+        )
+        .bind(caller_user_id)
+        .fetch_one(&state.db)
+        .await
+        .expect("audit count must be queryable");
+        assert_eq!(audits_after, audits_before);
     }
 }
