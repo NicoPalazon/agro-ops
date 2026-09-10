@@ -17,6 +17,6 @@ describe("LoginSubmitButton", () => {
     const markup = renderToStaticMarkup(<LoginSubmitButton />);
 
     expect(markup).toContain("disabled");
-    expect(markup).toContain("Signing in...");
+    expect(markup).toContain("Ingresando...");
   });
 });

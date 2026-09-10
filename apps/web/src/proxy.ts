@@ -29,7 +29,11 @@ export async function proxy(request: NextRequest) {
     data: claims,
   } = await supabase.auth.getClaims();
 
-  if (request.nextUrl.pathname.startsWith("/internal") && !claims) {
+  const protectedRoute =
+    request.nextUrl.pathname.startsWith("/internal") ||
+    request.nextUrl.pathname.startsWith("/configuracion");
+
+  if (protectedRoute && !claims) {
     const loginUrl = request.nextUrl.clone();
     loginUrl.pathname = "/login";
     loginUrl.search = "";
@@ -48,5 +52,5 @@ export async function proxy(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/internal/:path*"],
+  matcher: ["/internal/:path*", "/configuracion/:path*"],
 };

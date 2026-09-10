@@ -1,0 +1,82 @@
+.page {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  padding: 28px;
+  background: #f6f8f6;
+}
+
+.card {
+  width: min(100%, 440px);
+  border: 1px solid #dce3de;
+  border-radius: 12px;
+  padding: 32px;
+  background: white;
+}
+
+.eyebrow {
+  color: #176c47;
+  font-size: 12px;
+  font-weight: 750;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.card h1 {
+  margin-top: 8px;
+  font-size: 30px;
+}
+
+.card > p:not(.eyebrow) {
+  margin-top: 16px;
+  color: #657069;
+  line-height: 1.6;
+}
+
+.card form {
+  display: grid;
+  gap: 18px;
+  margin-top: 24px;
+}
+
+.card label {
+  display: grid;
+  gap: 7px;
+  color: #657069;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.card input {
+  border: 1px solid #dce3de;
+  border-radius: 7px;
+  padding: 11px 12px;
+  color: #18201b;
+  background: white;
+  font: inherit;
+}
+
+.card button,
+.card a {
+  justify-self: start;
+  border: 0;
+  border-radius: 7px;
+  padding: 11px 16px;
+  color: white;
+  background: #176c47;
+  font: inherit;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.card a {
+  display: inline-block;
+  margin-top: 24px;
+}
+
+.card [role="alert"] {
+  color: #a13d2d;
+  font-size: 13px;
+  line-height: 1.5;
+}

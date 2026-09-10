@@ -41,6 +41,19 @@ describe("private route proxy", () => {
     );
   });
 
+  it("also protects configuration routes and preserves their return path", async () => {
+    auth.getClaims.mockResolvedValue({ data: null });
+
+    const response = await proxy(request("/configuracion/usuarios?estado=activo"));
+    const location = new URL(response.headers.get("location")!);
+
+    expect(response.status).toBe(307);
+    expect(location.pathname).toBe("/login");
+    expect(location.searchParams.get("next")).toBe(
+      "/configuracion/usuarios?estado=activo",
+    );
+  });
+
   it("lets an authenticated user reach the requested internal page", async () => {
     auth.getClaims.mockResolvedValue({ data: { claims: { sub: "user-id" } } });
 

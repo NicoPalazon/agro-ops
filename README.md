@@ -50,7 +50,7 @@ La separación de responsabilidades es:
 - Main protegida
 - Cambios mediante branches y Pull Requests
 
-## Estructura prevista
+## Estructura
 
     agro-ops/
     ├── apps/
@@ -79,14 +79,10 @@ La separación de responsabilidades es:
 
 ## Estado
 
-Proyecto en bootstrap inicial.
+La base transversal de la Etapa 2 está implementada: autenticación y autorización
+por capacidades, administración de accesos, auditoría, Jobs PostgreSQL, outbox
+transaccional, documentos privados, referencias externas, idempotencia de comandos
+y diagnósticos de la Consola técnica.
 
-Primer objetivo técnico: construir el walking skeleton con:
-
-1. Next.js
-2. Rust/Axum
-3. PostgreSQL/PostGIS
-4. Worker Rust
-5. Docker Compose
-6. GitHub Actions
-7. Staging
+La Etapa 3 (territorio, campañas y cartografía) es el próximo hito y todavía no
+forma parte de la implementación actual.

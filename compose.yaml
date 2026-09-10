@@ -49,6 +49,10 @@ services:
       DATABASE_URL: postgres://agro_ops:agro_ops@postgres:5432/agro_ops
       SUPABASE_URL: ${SUPABASE_URL:-}
       SUPABASE_PUBLISHABLE_KEY: ${SUPABASE_PUBLISHABLE_KEY:-}
+      SUPABASE_SECRET_KEY: ${SUPABASE_SECRET_KEY:-}
+      SUPABASE_INVITE_REDIRECT_URL: ${SUPABASE_INVITE_REDIRECT_URL:-http://localhost:3000/aceptar-invitacion}
+      SUPABASE_STORAGE_BUCKET: ${SUPABASE_STORAGE_BUCKET:-documentos_privados}
+      DOCUMENT_MAX_UPLOAD_BYTES: ${DOCUMENT_MAX_UPLOAD_BYTES:-10485760}
       RUST_LOG: info
 
     ports:
@@ -87,6 +91,9 @@ services:
     environment:
       APP_ENV: local
       DATABASE_URL: postgres://agro_ops:agro_ops@postgres:5432/agro_ops
+      JOB_POLL_INTERVAL_MILLISECONDS: ${JOB_POLL_INTERVAL_MILLISECONDS:-1000}
+      JOB_CLAIM_BATCH_SIZE: ${JOB_CLAIM_BATCH_SIZE:-10}
+      JOB_STALE_THRESHOLD_SECONDS: ${JOB_STALE_THRESHOLD_SECONDS:-300}
       RUST_LOG: info
 
     volumes:

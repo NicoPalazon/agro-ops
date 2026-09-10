@@ -7,7 +7,7 @@ export function SignOutButton() {
 
   return (
     <button disabled={pending} type="submit">
-      {pending ? "Signing out..." : "Sign out"}
+      {pending ? "Cerrando sesión..." : "Cerrar sesión"}
     </button>
   );
 }

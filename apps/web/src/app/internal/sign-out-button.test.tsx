@@ -17,6 +17,6 @@ describe("SignOutButton", () => {
     const markup = renderToStaticMarkup(<SignOutButton />);
 
     expect(markup).toContain("disabled");
-    expect(markup).toContain("Signing out...");
+    expect(markup).toContain("Cerrando sesión...");
   });
 });

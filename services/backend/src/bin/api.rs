@@ -3,8 +3,10 @@ use std::net::SocketAddr;
 use agro_ops_backend::{
     AppState, app,
     auth::SupabaseAuthVerifier,
-    config::{RuntimeConfig, SupabaseAuthConfig},
+    config::{DocumentConfig, RuntimeConfig, SupabaseAdminConfig, SupabaseAuthConfig},
     shutdown::shutdown_signal,
+    supabase_admin::SupabaseIdentityAdmin,
+    supabase_storage::SupabaseDocumentStorage,
     telemetry::init_tracing,
 };
 use sqlx::postgres::PgPoolOptions;
@@ -33,6 +35,29 @@ async fn main() {
         );
         std::process::exit(1);
     });
+    let admin_config =
+        SupabaseAdminConfig::from_env(config.app_environment()).unwrap_or_else(|error| {
+            error!(service = "api", %error, "startup access-administration configuration invalid");
+            std::process::exit(1);
+        });
+    let external_identity_admin = SupabaseIdentityAdmin::new(&admin_config).unwrap_or_else(|_| {
+        error!(
+            service = "api",
+            "startup access-administration configuration invalid"
+        );
+        std::process::exit(1);
+    });
+    let document_config = DocumentConfig::from_env().unwrap_or_else(|error| {
+        error!(service = "api", %error, "startup document configuration invalid");
+        std::process::exit(1);
+    });
+    let document_storage = SupabaseDocumentStorage::new(&admin_config).unwrap_or_else(|_| {
+        error!(
+            service = "api",
+            "startup document storage configuration invalid"
+        );
+        std::process::exit(1);
+    });
     let db = PgPoolOptions::new()
         .max_connections(5)
         .connect_lazy(config.database_url())
@@ -46,6 +71,11 @@ async fn main() {
     let state = AppState {
         db,
         auth: Arc::new(auth),
+        external_identity_admin: Arc::new(external_identity_admin),
+        document_storage: Arc::new(document_storage),
+        document_settings: agro_ops_backend::documents::DocumentSettings::from_config(
+            &document_config,
+        ),
     };
 
     let address = SocketAddr::from(([0, 0, 0, 0], config.port()));

@@ -10,7 +10,7 @@ function requiredStagingSecret(name: string): string {
   return value;
 }
 
-test("an anonymous System Status deep link authenticates through the login UI and retains its session", async ({
+test("un enlace privado conserva el destino durante el inicio de sesión", async ({
   page,
 }) => {
   const email = requiredStagingSecret("STAGING_SMOKE_EMAIL");
@@ -23,21 +23,29 @@ test("an anonymous System Status deep link authenticates through the login UI an
   expect(loginUrl.pathname).toBe("/login");
   expect(loginUrl.searchParams.get("next")).toBe("/internal/system-status");
 
-  await page.getByLabel("Email").fill(email);
-  await page.getByLabel("Password").fill(password);
-  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+  await page.getByLabel("Correo electrónico").fill(email);
+  await page.getByLabel("Contraseña").fill(password);
+  await page
+    .getByRole("button", { name: "Iniciar sesión", exact: true })
+    .click();
 
   await expect(page).toHaveURL(/\/internal\/system-status$/);
-  await expect(page.getByRole("heading", { name: "System Status" })).toBeVisible();
-  await expect(page.getByRole("list", { name: "Service status" })).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Estado del sistema" }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("list", { name: "Estado de servicios" }),
+  ).toBeVisible();
 
-  for (const service of ["Web", "API", "Database", "Worker"]) {
-    await expect(page.getByLabel(`${service}: Operational`)).toBeVisible();
+  for (const service of ["Web", "API", "Base de datos", "Worker"]) {
+    await expect(page.getByLabel(`${service}: Operativo`)).toBeVisible();
   }
 
   await page.reload();
 
   await expect(page).toHaveURL(/\/internal\/system-status$/);
-  await expect(page.getByRole("heading", { name: "System Status" })).toBeVisible();
-  await expect(page.getByLabel("Web: Operational")).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Estado del sistema" }),
+  ).toBeVisible();
+  await expect(page.getByLabel("Web: Operativo")).toBeVisible();
 });

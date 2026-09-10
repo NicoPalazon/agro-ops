@@ -2,6 +2,10 @@ use std::{fmt, time::Duration};
 
 const DEFAULT_PORT: u16 = 8080;
 const DEFAULT_WORKER_HEARTBEAT_INTERVAL_SECONDS: u64 = 5;
+const DEFAULT_JOB_POLL_INTERVAL_MILLISECONDS: u64 = 1_000;
+const DEFAULT_JOB_CLAIM_BATCH_SIZE: u16 = 10;
+const DEFAULT_JOB_STALE_THRESHOLD_SECONDS: u64 = 300;
+const DEFAULT_DOCUMENT_MAX_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppEnvironment {
@@ -37,10 +41,20 @@ pub enum ConfigError {
     MissingDatabaseUrl,
     InvalidPort,
     InvalidWorkerHeartbeatInterval,
+    InvalidJobPollInterval,
+    InvalidJobClaimBatchSize,
+    InvalidJobStaleThreshold,
     MissingSupabaseUrl,
     InvalidSupabaseUrl,
     InsecureSupabaseUrl,
     MissingSupabasePublishableKey,
+    MissingSupabaseSecretKey,
+    MissingSupabaseInviteRedirectUrl,
+    InvalidSupabaseInviteRedirectUrl,
+    InsecureSupabaseInviteRedirectUrl,
+    MissingSupabaseStorageBucket,
+    InvalidSupabaseStorageBucket,
+    InvalidDocumentMaxUploadBytes,
 }
 
 impl fmt::Display for ConfigError {
@@ -58,6 +72,15 @@ impl fmt::Display for ConfigError {
             Self::InvalidWorkerHeartbeatInterval => formatter.write_str(
                 "invalid configuration: WORKER_HEARTBEAT_INTERVAL_SECONDS must be a positive integer",
             ),
+            Self::InvalidJobPollInterval => formatter.write_str(
+                "invalid configuration: JOB_POLL_INTERVAL_MILLISECONDS must be a positive integer",
+            ),
+            Self::InvalidJobClaimBatchSize => formatter.write_str(
+                "invalid configuration: JOB_CLAIM_BATCH_SIZE must be an integer between 1 and 100",
+            ),
+            Self::InvalidJobStaleThreshold => formatter.write_str(
+                "invalid configuration: JOB_STALE_THRESHOLD_SECONDS must be a positive integer",
+            ),
             Self::MissingSupabaseUrl => {
                 formatter.write_str("invalid configuration: SUPABASE_URL is required for API authentication")
             }
@@ -69,6 +92,27 @@ impl fmt::Display for ConfigError {
             ),
             Self::MissingSupabasePublishableKey => formatter.write_str(
                 "invalid configuration: SUPABASE_PUBLISHABLE_KEY is required for API authentication",
+            ),
+            Self::MissingSupabaseSecretKey => formatter.write_str(
+                "invalid configuration: SUPABASE_SECRET_KEY is required for access administration",
+            ),
+            Self::MissingSupabaseInviteRedirectUrl => formatter.write_str(
+                "invalid configuration: SUPABASE_INVITE_REDIRECT_URL is required for access administration",
+            ),
+            Self::InvalidSupabaseInviteRedirectUrl => formatter.write_str(
+                "invalid configuration: SUPABASE_INVITE_REDIRECT_URL must be an absolute HTTP(S) URL",
+            ),
+            Self::InsecureSupabaseInviteRedirectUrl => formatter.write_str(
+                "invalid configuration: SUPABASE_INVITE_REDIRECT_URL must use HTTPS outside local development",
+            ),
+            Self::MissingSupabaseStorageBucket => formatter.write_str(
+                "invalid configuration: SUPABASE_STORAGE_BUCKET is required for private documents",
+            ),
+            Self::InvalidSupabaseStorageBucket => formatter.write_str(
+                "invalid configuration: SUPABASE_STORAGE_BUCKET must be a bounded canonical bucket code",
+            ),
+            Self::InvalidDocumentMaxUploadBytes => formatter.write_str(
+                "invalid configuration: DOCUMENT_MAX_UPLOAD_BYTES must be an integer between 1 and 26214400",
             ),
         }
     }
@@ -144,7 +188,151 @@ impl fmt::Debug for SupabaseAuthConfig {
     }
 }
 
+#[derive(Clone)]
+pub struct SupabaseAdminConfig {
+    url: String,
+    secret_key: String,
+    invite_redirect_url: String,
+}
+
+impl SupabaseAdminConfig {
+    pub fn from_env(app_environment: AppEnvironment) -> Result<Self, ConfigError> {
+        Self::from_lookup(app_environment, |key| std::env::var(key).ok())
+    }
+
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub fn secret_key(&self) -> &str {
+        &self.secret_key
+    }
+
+    pub fn invite_redirect_url(&self) -> &str {
+        &self.invite_redirect_url
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_values(
+        app_environment: AppEnvironment,
+        url: impl Into<String>,
+        secret_key: impl Into<String>,
+        invite_redirect_url: impl Into<String>,
+    ) -> Result<Self, ConfigError> {
+        let url = url.into();
+        let secret_key = secret_key.into();
+        let invite_redirect_url = invite_redirect_url.into();
+        Self::from_lookup(app_environment, |key| match key {
+            "SUPABASE_URL" => Some(url.clone()),
+            "SUPABASE_SECRET_KEY" => Some(secret_key.clone()),
+            "SUPABASE_INVITE_REDIRECT_URL" => Some(invite_redirect_url.clone()),
+            _ => None,
+        })
+    }
+
+    fn from_lookup<F>(app_environment: AppEnvironment, lookup: F) -> Result<Self, ConfigError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let url = lookup("SUPABASE_URL")
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(ConfigError::MissingSupabaseUrl)?;
+        let parsed_url = reqwest::Url::parse(&url).map_err(|_| ConfigError::InvalidSupabaseUrl)?;
+        if !matches!(parsed_url.scheme(), "http" | "https") || parsed_url.host().is_none() {
+            return Err(ConfigError::InvalidSupabaseUrl);
+        }
+        if app_environment != AppEnvironment::Local && parsed_url.scheme() != "https" {
+            return Err(ConfigError::InsecureSupabaseUrl);
+        }
+        let secret_key = lookup("SUPABASE_SECRET_KEY")
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(ConfigError::MissingSupabaseSecretKey)?;
+        let invite_redirect_url = lookup("SUPABASE_INVITE_REDIRECT_URL")
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(ConfigError::MissingSupabaseInviteRedirectUrl)?;
+        let parsed_redirect_url = reqwest::Url::parse(&invite_redirect_url)
+            .map_err(|_| ConfigError::InvalidSupabaseInviteRedirectUrl)?;
+        if !matches!(parsed_redirect_url.scheme(), "http" | "https")
+            || parsed_redirect_url.host().is_none()
+        {
+            return Err(ConfigError::InvalidSupabaseInviteRedirectUrl);
+        }
+        if app_environment != AppEnvironment::Local && parsed_redirect_url.scheme() != "https" {
+            return Err(ConfigError::InsecureSupabaseInviteRedirectUrl);
+        }
+
+        Ok(Self {
+            url,
+            secret_key,
+            invite_redirect_url,
+        })
+    }
+}
+
+impl fmt::Debug for SupabaseAdminConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SupabaseAdminConfig")
+            .field("url", &self.url)
+            .field("secret_key", &"[REDACTED]")
+            .field("invite_redirect_url", &self.invite_redirect_url)
+            .finish()
+    }
+}
+
 impl std::error::Error for ConfigError {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DocumentConfig {
+    storage_bucket: String,
+    max_upload_bytes: usize,
+}
+
+impl DocumentConfig {
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Self::from_lookup(|key| std::env::var(key).ok())
+    }
+
+    pub fn storage_bucket(&self) -> &str {
+        &self.storage_bucket
+    }
+
+    pub fn max_upload_bytes(&self) -> usize {
+        self.max_upload_bytes
+    }
+
+    fn from_lookup<F>(lookup: F) -> Result<Self, ConfigError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let storage_bucket = lookup("SUPABASE_STORAGE_BUCKET")
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(ConfigError::MissingSupabaseStorageBucket)?;
+        if storage_bucket.len() > 63 || !is_storage_bucket_code(&storage_bucket) {
+            return Err(ConfigError::InvalidSupabaseStorageBucket);
+        }
+        let max_upload_bytes = match lookup("DOCUMENT_MAX_UPLOAD_BYTES") {
+            Some(value) => value
+                .parse::<usize>()
+                .ok()
+                .filter(|value| (1..=25 * 1024 * 1024).contains(value))
+                .ok_or(ConfigError::InvalidDocumentMaxUploadBytes)?,
+            None => DEFAULT_DOCUMENT_MAX_UPLOAD_BYTES,
+        };
+        Ok(Self {
+            storage_bucket,
+            max_upload_bytes,
+        })
+    }
+}
+
+fn is_storage_bucket_code(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    matches!(bytes.next(), Some(b'a'..=b'z'))
+        && bytes.all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'
+        })
+}
 
 #[derive(Clone)]
 pub struct RuntimeConfig {
@@ -152,6 +340,9 @@ pub struct RuntimeConfig {
     database_url: String,
     port: u16,
     worker_heartbeat_interval: Duration,
+    job_poll_interval: Duration,
+    job_claim_batch_size: u16,
+    job_stale_threshold: Duration,
 }
 
 impl RuntimeConfig {
@@ -173,6 +364,18 @@ impl RuntimeConfig {
 
     pub fn worker_heartbeat_interval(&self) -> Duration {
         self.worker_heartbeat_interval
+    }
+
+    pub fn job_poll_interval(&self) -> Duration {
+        self.job_poll_interval
+    }
+
+    pub fn job_claim_batch_size(&self) -> u16 {
+        self.job_claim_batch_size
+    }
+
+    pub fn job_stale_threshold(&self) -> Duration {
+        self.job_stale_threshold
     }
 
     fn from_lookup<F>(lookup: F) -> Result<Self, ConfigError>
@@ -203,12 +406,41 @@ impl RuntimeConfig {
                 .ok_or(ConfigError::InvalidWorkerHeartbeatInterval)?,
             None => Duration::from_secs(DEFAULT_WORKER_HEARTBEAT_INTERVAL_SECONDS),
         };
+        let job_poll_interval = match lookup("JOB_POLL_INTERVAL_MILLISECONDS") {
+            Some(value) => value
+                .parse::<u64>()
+                .ok()
+                .filter(|milliseconds| *milliseconds > 0)
+                .map(Duration::from_millis)
+                .ok_or(ConfigError::InvalidJobPollInterval)?,
+            None => Duration::from_millis(DEFAULT_JOB_POLL_INTERVAL_MILLISECONDS),
+        };
+        let job_claim_batch_size = match lookup("JOB_CLAIM_BATCH_SIZE") {
+            Some(value) => value
+                .parse::<u16>()
+                .ok()
+                .filter(|size| (1..=crate::jobs::MAX_CLAIM_BATCH_SIZE).contains(size))
+                .ok_or(ConfigError::InvalidJobClaimBatchSize)?,
+            None => DEFAULT_JOB_CLAIM_BATCH_SIZE,
+        };
+        let job_stale_threshold = match lookup("JOB_STALE_THRESHOLD_SECONDS") {
+            Some(value) => value
+                .parse::<u64>()
+                .ok()
+                .filter(|seconds| *seconds > 0)
+                .map(Duration::from_secs)
+                .ok_or(ConfigError::InvalidJobStaleThreshold)?,
+            None => Duration::from_secs(DEFAULT_JOB_STALE_THRESHOLD_SECONDS),
+        };
 
         Ok(Self {
             app_environment,
             database_url,
             port,
             worker_heartbeat_interval,
+            job_poll_interval,
+            job_claim_batch_size,
+            job_stale_threshold,
         })
     }
 }
@@ -221,6 +453,9 @@ impl fmt::Debug for RuntimeConfig {
             .field("database_url", &"[REDACTED]")
             .field("port", &self.port)
             .field("worker_heartbeat_interval", &self.worker_heartbeat_interval)
+            .field("job_poll_interval", &self.job_poll_interval)
+            .field("job_claim_batch_size", &self.job_claim_batch_size)
+            .field("job_stale_threshold", &self.job_stale_threshold)
             .finish()
     }
 }
@@ -249,6 +484,15 @@ mod tests {
         assert_eq!(
             config.worker_heartbeat_interval(),
             Duration::from_secs(DEFAULT_WORKER_HEARTBEAT_INTERVAL_SECONDS)
+        );
+        assert_eq!(
+            config.job_poll_interval(),
+            Duration::from_millis(DEFAULT_JOB_POLL_INTERVAL_MILLISECONDS)
+        );
+        assert_eq!(config.job_claim_batch_size(), DEFAULT_JOB_CLAIM_BATCH_SIZE);
+        assert_eq!(
+            config.job_stale_threshold(),
+            Duration::from_secs(DEFAULT_JOB_STALE_THRESHOLD_SECONDS)
         );
     }
 
@@ -294,11 +538,17 @@ mod tests {
             ("DATABASE_URL", DATABASE_URL),
             ("PORT", "9090"),
             ("WORKER_HEARTBEAT_INTERVAL_SECONDS", "10"),
+            ("JOB_POLL_INTERVAL_MILLISECONDS", "250"),
+            ("JOB_CLAIM_BATCH_SIZE", "4"),
+            ("JOB_STALE_THRESHOLD_SECONDS", "90"),
         ])
         .expect("port configuration must be valid");
 
         assert_eq!(config.port(), 9090);
         assert_eq!(config.worker_heartbeat_interval(), Duration::from_secs(10));
+        assert_eq!(config.job_poll_interval(), Duration::from_millis(250));
+        assert_eq!(config.job_claim_batch_size(), 4);
+        assert_eq!(config.job_stale_threshold(), Duration::from_secs(90));
     }
 
     #[test]
@@ -343,6 +593,32 @@ mod tests {
             "invalid configuration: WORKER_HEARTBEAT_INTERVAL_SECONDS must be a positive integer"
         );
         assert!(!format!("{error:?}").contains(DATABASE_URL));
+    }
+
+    #[test]
+    fn rejects_invalid_job_runtime_settings() {
+        for (key, value, expected) in [
+            (
+                "JOB_POLL_INTERVAL_MILLISECONDS",
+                "0",
+                ConfigError::InvalidJobPollInterval,
+            ),
+            (
+                "JOB_CLAIM_BATCH_SIZE",
+                "101",
+                ConfigError::InvalidJobClaimBatchSize,
+            ),
+            (
+                "JOB_STALE_THRESHOLD_SECONDS",
+                "invalid",
+                ConfigError::InvalidJobStaleThreshold,
+            ),
+        ] {
+            let error = config(&[("DATABASE_URL", DATABASE_URL), (key, value)])
+                .expect_err("invalid job runtime setting must fail");
+            assert_eq!(error, expected);
+            assert!(!format!("{error:?}").contains(DATABASE_URL));
+        }
     }
 
     #[test]
@@ -416,5 +692,59 @@ mod tests {
             .expect_err("non-local Supabase authentication must use HTTPS");
             assert_eq!(error, ConfigError::InsecureSupabaseUrl);
         }
+    }
+
+    #[test]
+    fn reads_and_redacts_supabase_admin_configuration() {
+        let secret = "service-role-secret-value";
+        let config = SupabaseAdminConfig::from_values(
+            AppEnvironment::Staging,
+            "https://project.supabase.co",
+            secret,
+            "https://web.example.com/aceptar-invitacion",
+        )
+        .expect("Supabase Admin configuration must be valid");
+
+        assert_eq!(config.url(), "https://project.supabase.co");
+        assert_eq!(config.secret_key(), secret);
+        assert_eq!(
+            config.invite_redirect_url(),
+            "https://web.example.com/aceptar-invitacion"
+        );
+        assert!(!format!("{config:?}").contains(secret));
+    }
+
+    #[test]
+    fn requires_supabase_secret_key_for_access_administration() {
+        let error = SupabaseAdminConfig::from_lookup(AppEnvironment::Local, |key| match key {
+            "SUPABASE_URL" => Some("http://127.0.0.1:54321".to_owned()),
+            "SUPABASE_INVITE_REDIRECT_URL" => {
+                Some("http://127.0.0.1:3000/aceptar-invitacion".to_owned())
+            }
+            _ => None,
+        })
+        .expect_err("Supabase Admin credentials must be required by the API");
+
+        assert_eq!(error, ConfigError::MissingSupabaseSecretKey);
+    }
+
+    #[test]
+    fn requires_and_validates_the_invitation_redirect_url() {
+        let missing = SupabaseAdminConfig::from_lookup(AppEnvironment::Local, |key| match key {
+            "SUPABASE_URL" => Some("http://127.0.0.1:54321".to_owned()),
+            "SUPABASE_SECRET_KEY" => Some("secret".to_owned()),
+            _ => None,
+        })
+        .expect_err("invitation redirect must be explicit");
+        assert_eq!(missing, ConfigError::MissingSupabaseInviteRedirectUrl);
+
+        let insecure = SupabaseAdminConfig::from_values(
+            AppEnvironment::Staging,
+            "https://project.supabase.co",
+            "secret",
+            "http://web.example.com/aceptar-invitacion",
+        )
+        .expect_err("staging invitation redirect must use HTTPS");
+        assert_eq!(insecure, ConfigError::InsecureSupabaseInviteRedirectUrl);
     }
 }

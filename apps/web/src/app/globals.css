@@ -42,6 +42,44 @@ a {
   text-decoration: none;
 }
 
+.state-page {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  padding: 32px;
+}
+
+.state-page > div {
+  max-width: 520px;
+  text-align: center;
+}
+
+.state-page h1 {
+  margin-top: 8px;
+  font-size: 36px;
+}
+
+.state-page p:not(.state-eyebrow) {
+  margin-top: 16px;
+  color: #657069;
+  line-height: 1.6;
+}
+
+.state-page a {
+  display: inline-block;
+  margin-top: 24px;
+  color: #19724b;
+  font-weight: 650;
+}
+
+.state-eyebrow {
+  color: #19724b;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
 @media (prefers-color-scheme: dark) {
   html {
     color-scheme: dark;

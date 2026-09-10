@@ -7,7 +7,7 @@ export function LoginSubmitButton() {
 
   return (
     <button disabled={pending} type="submit">
-      {pending ? "Signing in..." : "Sign in"}
+      {pending ? "Ingresando..." : "Iniciar sesión"}
     </button>
   );
 }
