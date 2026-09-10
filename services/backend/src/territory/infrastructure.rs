@@ -1,6 +1,7 @@
 use async_trait::async_trait;
-use serde_json::json;
-use sqlx::{PgPool, Postgres, Transaction};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use sqlx::{PgPool, Postgres, Transaction, types::Json};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -11,7 +12,11 @@ use crate::{
         NewExternalReference,
     },
     territory::{
-        application::{TerritoryStore, TerritoryStoreError},
+        application::{
+            BasePlotView, CampaignView, EstablishmentView, ExternalReferenceView,
+            GeoJsonMultiPolygon, OperationalUnitView, TerritorialUseAssignmentView,
+            TerritoryReadStore, TerritoryReadStoreError, TerritoryStore, TerritoryStoreError,
+        },
         domain::{
             CanonicalTerritorialCode, Establecimiento, FunctionalName, GeometryProvenance,
             LoteBase, NewEstablecimiento, NewLoteBase, TERRITORIAL_SRID,
@@ -92,6 +97,303 @@ impl TerritoryStore for PostgresTerritoryStore {
             }
         }
     }
+}
+
+#[async_trait]
+impl TerritoryReadStore for PostgresTerritoryStore {
+    async fn list_establecimientos(
+        &self,
+        organization_id: Uuid,
+    ) -> Result<Vec<EstablishmentView>, TerritoryReadStoreError> {
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM public.establecimientos WHERE organizacion_id = $1 ORDER BY codigo, id",
+        )
+        .bind(organization_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(map_read_database_error)?;
+
+        let mut establecimientos = Vec::with_capacity(ids.len());
+        for id in ids {
+            establecimientos.push(self.establecimiento(organization_id, id).await?);
+        }
+        Ok(establecimientos)
+    }
+
+    async fn get_establecimiento(
+        &self,
+        organization_id: Uuid,
+        establecimiento_id: Uuid,
+    ) -> Result<EstablishmentView, TerritoryReadStoreError> {
+        self.establecimiento(organization_id, establecimiento_id)
+            .await
+    }
+
+    async fn list_campanas(
+        &self,
+        organization_id: Uuid,
+    ) -> Result<Vec<CampaignView>, TerritoryReadStoreError> {
+        let rows: Vec<(Uuid, String, String, time::Date, time::Date, bool)> = sqlx::query_as(
+            "SELECT id, codigo, nombre, fecha_inicio, fecha_fin, activa FROM public.campanas WHERE organizacion_id = $1 ORDER BY fecha_inicio DESC, codigo, id",
+        )
+        .bind(organization_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(map_read_database_error)?;
+        Ok(rows.into_iter().map(campaign_from_row).collect())
+    }
+
+    async fn get_campana(
+        &self,
+        organization_id: Uuid,
+        campana_id: Uuid,
+    ) -> Result<CampaignView, TerritoryReadStoreError> {
+        let row: Option<(Uuid, String, String, time::Date, time::Date, bool)> = sqlx::query_as(
+            "SELECT id, codigo, nombre, fecha_inicio, fecha_fin, activa FROM public.campanas WHERE id = $1 AND organizacion_id = $2",
+        )
+        .bind(campana_id)
+        .bind(organization_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(map_read_database_error)?;
+        row.map(campaign_from_row)
+            .ok_or(TerritoryReadStoreError::NotFound)
+    }
+
+    async fn list_unidades_operativas(
+        &self,
+        organization_id: Uuid,
+        campana_id: Uuid,
+        establecimiento_id: Uuid,
+    ) -> Result<Vec<OperationalUnitView>, TerritoryReadStoreError> {
+        let context_exists: Option<bool> = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (SELECT 1 FROM public.campanas WHERE id = $1 AND organizacion_id = $3)
+               AND EXISTS (SELECT 1 FROM public.establecimientos WHERE id = $2 AND organizacion_id = $3)
+            "#,
+        )
+        .bind(campana_id)
+        .bind(establecimiento_id)
+        .bind(organization_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(map_read_database_error)?;
+        if context_exists != Some(true) {
+            return Err(TerritoryReadStoreError::NotFound);
+        }
+
+        let rows: Vec<(Uuid, Uuid, Uuid, String, String, bool, Json<Value>)> = sqlx::query_as(
+            r#"
+            SELECT id, campana_id, establecimiento_id, codigo, nombre, activa,
+                   ST_AsGeoJSON(geometria, 9, 0)::jsonb
+            FROM public.unidades_operativas
+            WHERE organizacion_id = $1 AND campana_id = $2 AND establecimiento_id = $3
+            ORDER BY codigo, id
+            "#,
+        )
+        .bind(organization_id)
+        .bind(campana_id)
+        .bind(establecimiento_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(map_read_database_error)?;
+
+        let mut units = Vec::with_capacity(rows.len());
+        for (id, campana_id, establecimiento_id, codigo, nombre, activa, Json(geometria)) in rows {
+            let lote_base_ids: Vec<Uuid> = sqlx::query_scalar(
+                r#"
+                SELECT vinculo.lote_base_id
+                FROM public.unidades_operativas_lotes_base AS vinculo
+                JOIN public.lotes_base AS lote_base ON lote_base.id = vinculo.lote_base_id
+                WHERE vinculo.unidad_operativa_id = $1
+                ORDER BY lote_base.codigo, lote_base.id
+                "#,
+            )
+            .bind(id)
+            .fetch_all(&self.db)
+            .await
+            .map_err(map_read_database_error)?;
+            units.push(OperationalUnitView {
+                id,
+                campana_id,
+                establecimiento_id,
+                codigo,
+                nombre,
+                activa,
+                geometria: multipolygon_from_geojson(geometria)?,
+                lote_base_ids,
+            });
+        }
+        Ok(units)
+    }
+
+    async fn list_usos_unidad_operativa(
+        &self,
+        organization_id: Uuid,
+        unidad_operativa_id: Uuid,
+    ) -> Result<Vec<TerritorialUseAssignmentView>, TerritoryReadStoreError> {
+        let exists: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM public.unidades_operativas WHERE id = $1 AND organizacion_id = $2",
+        )
+        .bind(unidad_operativa_id)
+        .bind(organization_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(map_read_database_error)?;
+        if exists.is_none() {
+            return Err(TerritoryReadStoreError::NotFound);
+        }
+        let rows: Vec<(Uuid, Uuid, String, String, time::Date, time::Date)> = sqlx::query_as(
+            r#"
+            SELECT asignacion.id, uso.id, uso.codigo, uso.nombre,
+                   asignacion.fecha_inicio, asignacion.fecha_fin
+            FROM public.unidades_operativas_usos AS asignacion
+            JOIN public.usos_territoriales AS uso ON uso.id = asignacion.uso_territorial_id
+            WHERE asignacion.unidad_operativa_id = $1
+            ORDER BY asignacion.fecha_inicio, asignacion.fecha_fin, asignacion.id
+            "#,
+        )
+        .bind(unidad_operativa_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(map_read_database_error)?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, uso_territorial_id, uso_codigo, uso_nombre, fecha_inicio, fecha_fin)| {
+                    TerritorialUseAssignmentView {
+                        id,
+                        uso_territorial_id,
+                        uso_codigo,
+                        uso_nombre,
+                        fecha_inicio,
+                        fecha_fin,
+                    }
+                },
+            )
+            .collect())
+    }
+}
+
+impl PostgresTerritoryStore {
+    async fn establecimiento(
+        &self,
+        organization_id: Uuid,
+        establecimiento_id: Uuid,
+    ) -> Result<EstablishmentView, TerritoryReadStoreError> {
+        let row: Option<(Uuid, String, String, bool, Json<Value>)> = sqlx::query_as(
+            r#"
+            SELECT id, codigo, nombre, activo, ST_AsGeoJSON(geometria, 9, 0)::jsonb
+            FROM public.establecimientos
+            WHERE id = $1 AND organizacion_id = $2
+            "#,
+        )
+        .bind(establecimiento_id)
+        .bind(organization_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(map_read_database_error)?;
+        let (id, codigo, nombre, activo, Json(geometria)) =
+            row.ok_or(TerritoryReadStoreError::NotFound)?;
+
+        let base_rows: Vec<(Uuid, String, String, bool, Json<Value>)> = sqlx::query_as(
+            r#"
+            SELECT id, codigo, nombre, activo, ST_AsGeoJSON(geometria, 9, 0)::jsonb
+            FROM public.lotes_base
+            WHERE organizacion_id = $1 AND establecimiento_id = $2
+            ORDER BY codigo, id
+            "#,
+        )
+        .bind(organization_id)
+        .bind(id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(map_read_database_error)?;
+        let lotes_base = base_rows
+            .into_iter()
+            .map(|(id, codigo, nombre, activo, Json(geometria))| {
+                Ok(BasePlotView {
+                    id,
+                    codigo,
+                    nombre,
+                    activo,
+                    geometria: multipolygon_from_geojson(geometria)?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let referencias_externas: Vec<(String, String)> = sqlx::query_as(
+            r#"
+            SELECT sistema_externo, external_id
+            FROM public.external_references
+            WHERE organizacion_id = $1 AND entidad_tipo = 'establecimiento' AND entidad_id = $2
+            ORDER BY creado_en, id
+            "#,
+        )
+        .bind(organization_id)
+        .bind(id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(map_read_database_error)?;
+
+        Ok(EstablishmentView {
+            id,
+            codigo,
+            nombre,
+            activo,
+            geometria: multipolygon_from_geojson(geometria)?,
+            referencias_externas: referencias_externas
+                .into_iter()
+                .map(|(sistema_externo, external_id)| ExternalReferenceView {
+                    sistema_externo,
+                    external_id,
+                })
+                .collect(),
+            lotes_base,
+        })
+    }
+}
+
+fn campaign_from_row(
+    (id, codigo, nombre, fecha_inicio, fecha_fin, activa): (
+        Uuid,
+        String,
+        String,
+        time::Date,
+        time::Date,
+        bool,
+    ),
+) -> CampaignView {
+    CampaignView {
+        id,
+        codigo,
+        nombre,
+        fecha_inicio,
+        fecha_fin,
+        activa,
+    }
+}
+
+#[derive(Deserialize)]
+struct RawGeoJsonGeometry {
+    #[serde(rename = "type")]
+    geometry_type: String,
+    coordinates: Vec<Vec<Vec<Vec<f64>>>>,
+}
+
+fn multipolygon_from_geojson(value: Value) -> Result<GeoJsonMultiPolygon, TerritoryReadStoreError> {
+    let raw: RawGeoJsonGeometry =
+        serde_json::from_value(value).map_err(|_| TerritoryReadStoreError::Unavailable)?;
+    if raw.geometry_type != "MultiPolygon" {
+        return Err(TerritoryReadStoreError::Unavailable);
+    }
+    Ok(GeoJsonMultiPolygon {
+        coordinates: raw.coordinates,
+    })
+}
+
+fn map_read_database_error(_: sqlx::Error) -> TerritoryReadStoreError {
+    TerritoryReadStoreError::Unavailable
 }
 
 async fn insert_establecimiento(

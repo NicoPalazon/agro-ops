@@ -59,7 +59,10 @@ erDiagram
         OPERATIONAL_UNIT ||--o{ OPERATIONAL_UNIT_USE : has_use
         ACTIVITY_USE ||--o{ OPERATIONAL_UNIT_USE : assigned_as
 
-        %% OperationalUnitUse is an identifying, history-preserving association.
+        %% OperationalUnitUse is an identifying, history-preserving temporal association.
+        %% A UOP may have zero or more sequential uses; concurrent uses are forbidden.
+        %% Validity is half-open: touching boundaries and temporal gaps are allowed.
+        %% Agronomic special cases remain in Agriculture and do not weaken this territory rule.
         %% Campaign-specific subdivision does not rewrite earlier Campaign geography.
         %% UOP/BasePlot is M:N within one Establishment; different Campaign partitions stay isolated.
     end
@@ -183,8 +186,6 @@ erDiagram
     %% - DocumentLink <-> generic business record target representation
     %% - Local entity <-> ExternalReference generic target representation
     %% - Business change <-> OutboxEvent generic source representation
-    %% Etapa 3:
-    %% - OperationalUnitUse simultaneity and confirmation obligatoriness
     %% Etapa 4-7:
     %% - Product <-> UnitOfMeasure cardinality/conversions
     %% - StockOperation <-> source Document/Event

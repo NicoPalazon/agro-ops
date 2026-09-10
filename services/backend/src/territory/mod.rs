@@ -5,6 +5,7 @@
 //! a RENSPA/SENASA perimeter. RENSPA is an external reference to the internal
 //! establishment UUID. Campaign-specific UOPs are deliberately not implemented.
 
+pub mod api;
 pub mod application;
 pub mod domain;
 pub mod infrastructure;

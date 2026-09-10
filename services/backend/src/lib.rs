@@ -81,7 +81,7 @@ struct ApiErrorResponse {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum RequestAccessError {
+pub(crate) enum RequestAccessError {
     AuthenticationFailed,
     AuthenticationUnavailable,
     PrincipalDenied,
@@ -338,8 +338,8 @@ impl Modify for SupabaseBearerSecurity {
         version = env!("CARGO_PKG_VERSION"),
         description = "HTTP contract for Agro Ops public health and protected transversal endpoints."
     ),
-    paths(health, ready, version, me, internal_worker_status, internal_system_status, internal_jobs, internal_outbox, internal_audit, internal_idempotencia, create_document, document_metadata, document_download),
-    components(schemas(StatusResponse, VersionResponse, MeResponse, SystemStatusResponse, ServiceStatus, ServiceStatusReport, jobs::JobState, jobs::JobDiagnostic, jobs::JobsDiagnosticsResponse, outbox::OutboxDiagnostic, outbox::OutboxDiagnosticsResponse, audit::AuditDiagnostic, audit::AuditDiagnosticsResponse, idempotency::IdempotencyDiagnostic, idempotency::IdempotencyDiagnosticsResponse, documents::DocumentMetadata, documents::CreatedDocument, documents::DocumentDownloadResponse)),
+    paths(health, ready, version, me, internal_worker_status, internal_system_status, internal_jobs, internal_outbox, internal_audit, internal_idempotencia, create_document, document_metadata, document_download, territory::api::list_establecimientos, territory::api::get_establecimiento, territory::api::list_campanas, territory::api::get_campana, territory::api::list_unidades_operativas, territory::api::list_usos_unidad_operativa),
+    components(schemas(StatusResponse, VersionResponse, MeResponse, SystemStatusResponse, ServiceStatus, ServiceStatusReport, jobs::JobState, jobs::JobDiagnostic, jobs::JobsDiagnosticsResponse, outbox::OutboxDiagnostic, outbox::OutboxDiagnosticsResponse, audit::AuditDiagnostic, audit::AuditDiagnosticsResponse, idempotency::IdempotencyDiagnostic, idempotency::IdempotencyDiagnosticsResponse, documents::DocumentMetadata, documents::CreatedDocument, documents::DocumentDownloadResponse, territory::api::EstablishmentResponse, territory::api::BasePlotResponse, territory::api::ExternalReferenceResponse, territory::api::GeoJsonMultiPolygonResponse, territory::api::CampaignResponse, territory::api::OperationalUnitResponse, territory::api::TerritorialUseAssignmentResponse)),
     modifiers(&SupabaseBearerSecurity)
 )]
 struct ApiDoc;
@@ -350,6 +350,7 @@ pub fn app(state: AppState) -> Router {
         .max_upload_bytes()
         .saturating_add(128 * 1024);
     Router::new()
+        .merge(territory::api::routes())
         .route("/documentos", post(create_document))
         .route("/documentos/{document_id}", get(document_metadata))
         .route("/documentos/{document_id}/descarga", get(document_download))
@@ -1078,7 +1079,7 @@ async fn authorize_request(
     Ok(context)
 }
 
-async fn resolve_request_context(
+pub(crate) async fn resolve_request_context(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<authorization::AuthorizationContext, RequestAccessError> {
