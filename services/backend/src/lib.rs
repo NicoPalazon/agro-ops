@@ -30,6 +30,7 @@ pub mod shutdown;
 pub mod supabase_admin;
 pub mod supabase_storage;
 pub mod telemetry;
+pub mod territory;
 pub mod worker;
 
 use service_heartbeats::{ServiceStatus, ServiceStatusReport, WORKER_SERVICE_NAME};

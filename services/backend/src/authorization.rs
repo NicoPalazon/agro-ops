@@ -6,8 +6,10 @@ use uuid::Uuid;
 pub const SUPABASE_PROVIDER: &str = "supabase";
 
 pub mod permission_codes {
+    pub const AGRICULTURA_CREAR: &str = "agricultura:crear";
     pub const CONFIGURACION_ADMINISTRAR: &str = "configuracion:administrar";
     pub const CONSOLA_TECNICA_VER: &str = "consola_tecnica:ver";
+    pub const TERRITORIO_CREAR: &str = "territorio:crear";
 }
 
 const RESOLVE_CONTEXT_SQL: &str = r#"
