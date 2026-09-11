@@ -7,12 +7,38 @@ use crate::{
         AuthorizationContext, PermissionDenied,
         permission_codes::{TERRITORIO_CREAR, TERRITORIO_VER},
     },
-    territory::domain::{Establecimiento, LoteBase, NewEstablecimiento, NewLoteBase},
+    territory::{
+        domain::{Establecimiento, LoteBase, NewEstablecimiento, NewLoteBase, TERRITORIAL_SRID},
+        senasa::{self, NormalizedPolygon4326, SenasaPolygonParseError},
+    },
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TerritoryStoreError {
     Conflict,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SenasaPolygonPreview {
+    pub source_coordinate_pair_count: usize,
+    pub geometry: GeoJsonMultiPolygon,
+    pub srid: i32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerritoryValidationError {
+    pub code: &'static str,
+    pub message: String,
+    pub detail: Option<String>,
+    pub line: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TerritoryPreviewStoreError {
+    InvalidTopology { reason: String },
+    EmptyGeometry,
+    UnexpectedSrid,
     Unavailable,
 }
 
@@ -140,12 +166,43 @@ pub trait TerritoryStore: Send + Sync {
     ) -> Result<LoteBase, TerritoryStoreError>;
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Read-only PostGIS validation boundary for normalized external geometry.
+#[async_trait]
+pub trait TerritoryPreviewStore: Send + Sync {
+    async fn preview_normalized_polygon(
+        &self,
+        polygon: &NormalizedPolygon4326,
+    ) -> Result<GeoJsonMultiPolygon, TerritoryPreviewStoreError>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerritoryApplicationError {
+    Validation(TerritoryValidationError),
     PermissionDenied,
     NotFound,
     Conflict,
     Unavailable,
+}
+
+pub async fn preview_senasa_polygon(
+    store: &dyn TerritoryPreviewStore,
+    context: &AuthorizationContext,
+    source_text: &str,
+) -> Result<SenasaPolygonPreview, TerritoryApplicationError> {
+    context
+        .require_permission(TERRITORIO_CREAR)
+        .map_err(|PermissionDenied| TerritoryApplicationError::PermissionDenied)?;
+    let polygon = senasa::parse_polygon(source_text).map_err(parser_validation_error)?;
+    let geometry = store
+        .preview_normalized_polygon(&polygon)
+        .await
+        .map_err(map_preview_store_error)?;
+
+    Ok(SenasaPolygonPreview {
+        source_coordinate_pair_count: polygon.source_coordinate_pair_count(),
+        geometry,
+        srid: TERRITORIAL_SRID,
+    })
 }
 
 pub async fn list_establecimientos(
@@ -263,6 +320,45 @@ fn map_store_error(error: TerritoryStoreError) -> TerritoryApplicationError {
     match error {
         TerritoryStoreError::Conflict => TerritoryApplicationError::Conflict,
         TerritoryStoreError::Unavailable => TerritoryApplicationError::Unavailable,
+    }
+}
+
+fn parser_validation_error(error: SenasaPolygonParseError) -> TerritoryApplicationError {
+    TerritoryApplicationError::Validation(TerritoryValidationError {
+        code: error.kind.code(),
+        message: error.kind.message().to_owned(),
+        detail: None,
+        line: error.line,
+    })
+}
+
+fn map_preview_store_error(error: TerritoryPreviewStoreError) -> TerritoryApplicationError {
+    match error {
+        TerritoryPreviewStoreError::InvalidTopology { reason } => {
+            TerritoryApplicationError::Validation(TerritoryValidationError {
+                code: "topologia_invalida",
+                message: "La geometría contiene una topología inválida.".to_owned(),
+                detail: Some(reason),
+                line: None,
+            })
+        }
+        TerritoryPreviewStoreError::EmptyGeometry => {
+            TerritoryApplicationError::Validation(TerritoryValidationError {
+                code: "geometria_vacia",
+                message: "La geometría no puede estar vacía.".to_owned(),
+                detail: None,
+                line: None,
+            })
+        }
+        TerritoryPreviewStoreError::UnexpectedSrid => {
+            TerritoryApplicationError::Validation(TerritoryValidationError {
+                code: "srid_invalido",
+                message: "La geometría debe usar SRID 4326.".to_owned(),
+                detail: None,
+                line: None,
+            })
+        }
+        TerritoryPreviewStoreError::Unavailable => TerritoryApplicationError::Unavailable,
     }
 }
 

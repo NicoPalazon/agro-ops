@@ -6,9 +6,9 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -17,8 +17,8 @@ use crate::{
     territory::{
         application::{
             self, BasePlotView, CampaignView, EstablishmentView, ExternalReferenceView,
-            GeoJsonMultiPolygon, OperationalUnitView, TerritorialUseAssignmentView,
-            TerritoryApplicationError,
+            GeoJsonMultiPolygon, OperationalUnitView, SenasaPolygonPreview,
+            TerritorialUseAssignmentView, TerritoryApplicationError, TerritoryValidationError,
         },
         infrastructure::PostgresTerritoryStore,
     },
@@ -102,6 +102,31 @@ pub struct TerritorialUseAssignmentResponse {
     fecha_fin: String,
 }
 
+#[derive(Deserialize, ToSchema)]
+pub struct SenasaPolygonPreviewRequest {
+    /// One `latitud, longitud` source pair per line.
+    texto_poligono: String,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct SenasaPolygonPreviewResponse {
+    cantidad_pares_coordenadas_fuente: usize,
+    geometria: GeoJsonMultiPolygonResponse,
+    tipo_geometria: &'static str,
+    srid: i32,
+    valida: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct TerritorialValidationErrorResponse {
+    codigo: &'static str,
+    mensaje: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detalle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    linea: Option<usize>,
+}
+
 #[derive(Debug)]
 pub(crate) enum TerritoryRequestError {
     Access(RequestAccessError),
@@ -124,6 +149,11 @@ impl IntoResponse for TerritoryRequestError {
     fn into_response(self) -> Response {
         match self {
             Self::Access(error) => error.into_response(),
+            Self::Application(TerritoryApplicationError::Validation(error)) => (
+                StatusCode::BAD_REQUEST,
+                Json(TerritorialValidationErrorResponse::from(error)),
+            )
+                .into_response(),
             Self::Application(TerritoryApplicationError::PermissionDenied) => {
                 StatusCode::FORBIDDEN.into_response()
             }
@@ -157,6 +187,37 @@ pub fn routes() -> Router<AppState> {
             "/territorio/unidades-operativas/{unidad_operativa_id}/usos",
             get(list_usos_unidad_operativa),
         )
+        .route(
+            "/territorio/previsualizaciones/senasa-poligono",
+            post(preview_senasa_polygon),
+        )
+}
+
+#[utoipa::path(
+    post,
+    path = "/territorio/previsualizaciones/senasa-poligono",
+    request_body = SenasaPolygonPreviewRequest,
+    security(("supabaseBearer" = [])),
+    responses(
+        (status = 200, description = "Read-only normalized MultiPolygon preview.", body = SenasaPolygonPreviewResponse),
+        (status = 400, description = "The pasted source or its topology is invalid.", body = TerritorialValidationErrorResponse),
+        (status = 401, description = "A valid Supabase user access token is required."),
+        (status = 403, description = "The caller lacks territorio:crear."),
+        (status = 503, description = "Authentication or PostGIS validation is unavailable.")
+    )
+)]
+pub(crate) async fn preview_senasa_polygon(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<SenasaPolygonPreviewRequest>,
+) -> Result<Json<SenasaPolygonPreviewResponse>, TerritoryRequestError> {
+    let context = crate::resolve_request_context(&state, &headers).await?;
+    let store = PostgresTerritoryStore::new(state.db.clone());
+    application::preview_senasa_polygon(&store, &context, &request.texto_poligono)
+        .await
+        .map(SenasaPolygonPreviewResponse::from)
+        .map(Json)
+        .map_err(Into::into)
 }
 
 #[utoipa::path(
@@ -331,6 +392,29 @@ impl From<GeoJsonMultiPolygon> for GeoJsonMultiPolygonResponse {
         Self {
             geometry_type: "MultiPolygon",
             coordinates: value.coordinates,
+        }
+    }
+}
+
+impl From<SenasaPolygonPreview> for SenasaPolygonPreviewResponse {
+    fn from(value: SenasaPolygonPreview) -> Self {
+        Self {
+            cantidad_pares_coordenadas_fuente: value.source_coordinate_pair_count,
+            geometria: value.geometry.into(),
+            tipo_geometria: "MultiPolygon",
+            srid: value.srid,
+            valida: true,
+        }
+    }
+}
+
+impl From<TerritoryValidationError> for TerritorialValidationErrorResponse {
+    fn from(value: TerritoryValidationError) -> Self {
+        Self {
+            codigo: value.code,
+            mensaje: value.message,
+            detalle: value.detail,
+            linea: value.line,
         }
     }
 }

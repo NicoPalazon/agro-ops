@@ -15,12 +15,14 @@ use crate::{
         application::{
             BasePlotView, CampaignView, EstablishmentView, ExternalReferenceView,
             GeoJsonMultiPolygon, OperationalUnitView, TerritorialUseAssignmentView,
-            TerritoryReadStore, TerritoryReadStoreError, TerritoryStore, TerritoryStoreError,
+            TerritoryPreviewStore, TerritoryPreviewStoreError, TerritoryReadStore,
+            TerritoryReadStoreError, TerritoryStore, TerritoryStoreError,
         },
         domain::{
             CanonicalTerritorialCode, Establecimiento, FunctionalName, GeometryProvenance,
             LoteBase, NewEstablecimiento, NewLoteBase, TERRITORIAL_SRID,
         },
+        senasa::NormalizedPolygon4326,
     },
 };
 
@@ -96,6 +98,48 @@ impl TerritoryStore for PostgresTerritoryStore {
                 Err(error)
             }
         }
+    }
+}
+
+#[async_trait]
+impl TerritoryPreviewStore for PostgresTerritoryStore {
+    async fn preview_normalized_polygon(
+        &self,
+        polygon: &NormalizedPolygon4326,
+    ) -> Result<GeoJsonMultiPolygon, TerritoryPreviewStoreError> {
+        let row: (i32, bool, bool, Option<String>, Json<Value>) = sqlx::query_as(
+            r#"
+            WITH normalized AS (
+                SELECT ST_Multi(ST_SetSRID(ST_GeomFromGeoJSON($1::jsonb), $2)) AS geometria
+            )
+            SELECT ST_SRID(geometria),
+                   ST_IsEmpty(geometria),
+                   ST_IsValid(geometria),
+                   CASE WHEN ST_IsValid(geometria) THEN NULL ELSE ST_IsValidReason(geometria) END,
+                   ST_AsGeoJSON(geometria, 9, 0)::jsonb
+            FROM normalized
+            "#,
+        )
+        .bind(Json(polygon.as_geojson_polygon()))
+        .bind(TERRITORIAL_SRID)
+        .fetch_one(&self.db)
+        .await
+        .map_err(|_| TerritoryPreviewStoreError::Unavailable)?;
+
+        let (srid, is_empty, is_valid, validity_reason, Json(geometry)) = row;
+        if srid != TERRITORIAL_SRID {
+            return Err(TerritoryPreviewStoreError::UnexpectedSrid);
+        }
+        if is_empty {
+            return Err(TerritoryPreviewStoreError::EmptyGeometry);
+        }
+        if !is_valid {
+            return Err(TerritoryPreviewStoreError::InvalidTopology {
+                reason: validity_reason
+                    .unwrap_or_else(|| "PostGIS no pudo validar la geometría.".to_owned()),
+            });
+        }
+        multipolygon_from_geojson(geometry).map_err(|_| TerritoryPreviewStoreError::Unavailable)
     }
 }
 

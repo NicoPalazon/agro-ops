@@ -74,7 +74,7 @@ fn state(db: PgPool) -> AppState {
     }
 }
 
-async fn principal(db: &PgPool, grant_territory_read: bool) -> Principal {
+async fn principal(db: &PgPool, permission_codes: &[&str]) -> Principal {
     let organization_id: Uuid =
         sqlx::query_scalar("INSERT INTO public.organizaciones (nombre) VALUES ($1) RETURNING id")
             .bind(format!("Organización territorial API {}", Uuid::new_v4()))
@@ -113,18 +113,23 @@ async fn principal(db: &PgPool, grant_territory_read: bool) -> Principal {
         .execute(db)
         .await
         .expect("current user role must insert");
-    if grant_territory_read {
-        let permission_id: Uuid =
-            sqlx::query_scalar("SELECT id FROM public.permisos WHERE codigo = 'territorio:ver'")
-                .fetch_one(db)
+    if !permission_codes.is_empty() {
+        let permission_ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM public.permisos WHERE codigo = ANY($1) ORDER BY codigo",
+        )
+        .bind(permission_codes)
+        .fetch_all(db)
+        .await
+        .expect("territorial permissions must be present");
+        assert_eq!(permission_ids.len(), permission_codes.len());
+        for permission_id in permission_ids {
+            sqlx::query("INSERT INTO public.roles_permisos (rol_id, permiso_id) VALUES ($1, $2)")
+                .bind(role_id)
+                .bind(permission_id)
+                .execute(db)
                 .await
-                .expect("territorio:ver migration must be applied");
-        sqlx::query("INSERT INTO public.roles_permisos (rol_id, permiso_id) VALUES ($1, $2)")
-            .bind(role_id)
-            .bind(permission_id)
-            .execute(db)
-            .await
-            .expect("territory read permission must grant");
+                .expect("territorial permission must grant");
+        }
     }
 
     Principal {
@@ -271,6 +276,29 @@ async fn response(state: AppState, path: &str, subject: Option<Uuid>) -> axum::r
         .expect("request must complete")
 }
 
+async fn post_json(
+    state: AppState,
+    path: &str,
+    subject: Option<Uuid>,
+    body: Value,
+) -> axum::response::Response {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json");
+    if let Some(subject) = subject {
+        request = request.header("authorization", format!("Bearer test:{subject}"));
+    }
+    app(state)
+        .oneshot(
+            request
+                .body(Body::from(body.to_string()))
+                .expect("request must build"),
+        )
+        .await
+        .expect("request must complete")
+}
+
 async fn json_body(response: axum::response::Response) -> Value {
     serde_json::from_slice(
         &to_bytes(response.into_body(), usize::MAX)
@@ -284,10 +312,10 @@ async fn json_body(response: axum::response::Response) -> Value {
 async fn territorial_read_api_enforces_scope_and_preserves_canonical_geography_and_history() {
     let _guard = database_test_lock().lock().await;
     let db = test_pool().await;
-    let authorized = principal(&db, true).await;
+    let authorized = principal(&db, &["territorio:ver"]).await;
     let fixture = create_territory(&db, authorized).await;
-    let unauthorized = principal(&db, false).await;
-    let other = principal(&db, true).await;
+    let unauthorized = principal(&db, &[]).await;
+    let other = principal(&db, &["territorio:ver"]).await;
     let other_territory = create_territory(&db, other).await;
 
     assert_eq!(
@@ -435,4 +463,112 @@ async fn territorial_read_api_enforces_scope_and_preserves_canonical_geography_a
             .get("/territorio/unidades-operativas/{unidad_operativa_id}/usos")
             .is_some()
     );
+}
+
+#[tokio::test]
+async fn senasa_polygon_preview_api_normalizes_validates_and_never_persists_territorial_state() {
+    let _guard = database_test_lock().lock().await;
+    let db = test_pool().await;
+    let creator = principal(&db, &["territorio:crear"]).await;
+    let reader = principal(&db, &["territorio:ver"]).await;
+    let source = serde_json::json!({
+        "texto_poligono": "-33.7601, -59.81266\n-33.76887, -59.79991\n-33.78036, -59.81339\n-33.7601, -59.81266"
+    });
+    let before: (i64, i64, i64, i64) = sqlx::query_as(
+        r#"
+        SELECT
+            (SELECT COUNT(*)::bigint FROM public.establecimientos WHERE organizacion_id = $1),
+            (SELECT COUNT(*)::bigint FROM public.lotes_base WHERE organizacion_id = $1),
+            (SELECT COUNT(*)::bigint FROM public.external_references WHERE organizacion_id = $1),
+            (SELECT COUNT(*)::bigint FROM public.audit_events WHERE organizacion_id = $1)
+        "#,
+    )
+    .bind(creator.organization_id)
+    .fetch_one(&db)
+    .await
+    .expect("pre-preview state must be queryable");
+
+    assert_eq!(
+        post_json(
+            state(db.clone()),
+            "/territorio/previsualizaciones/senasa-poligono",
+            None,
+            source.clone(),
+        )
+        .await
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        post_json(
+            state(db.clone()),
+            "/territorio/previsualizaciones/senasa-poligono",
+            Some(reader.subject),
+            source.clone(),
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    let preview = post_json(
+        state(db.clone()),
+        "/territorio/previsualizaciones/senasa-poligono",
+        Some(creator.subject),
+        source,
+    )
+    .await;
+    assert_eq!(preview.status(), StatusCode::OK);
+    let preview = json_body(preview).await;
+    assert_eq!(preview["cantidad_pares_coordenadas_fuente"], 4);
+    assert_eq!(preview["tipo_geometria"], "MultiPolygon");
+    assert_eq!(preview["srid"], 4326);
+    assert_eq!(preview["valida"], true);
+    assert_eq!(preview["geometria"]["type"], "MultiPolygon");
+    assert_eq!(
+        preview["geometria"]["coordinates"][0][0][0],
+        serde_json::json!([-59.81266, -33.7601])
+    );
+
+    let bow_tie = post_json(
+        state(db.clone()),
+        "/territorio/previsualizaciones/senasa-poligono",
+        Some(creator.subject),
+        serde_json::json!({ "texto_poligono": "0, 0\n1, 1\n0, 1\n1, 0\n0, 0" }),
+    )
+    .await;
+    assert_eq!(bow_tie.status(), StatusCode::BAD_REQUEST);
+    let bow_tie = json_body(bow_tie).await;
+    assert_eq!(bow_tie["codigo"], "topologia_invalida");
+    assert!(
+        bow_tie["detalle"]
+            .as_str()
+            .unwrap()
+            .contains("Self-intersection")
+    );
+
+    let malformed = post_json(
+        state(db.clone()),
+        "/territorio/previsualizaciones/senasa-poligono",
+        Some(creator.subject),
+        serde_json::json!({ "texto_poligono": "-33.7," }),
+    )
+    .await;
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(malformed).await["codigo"], "coordenada_faltante");
+
+    let after: (i64, i64, i64, i64) = sqlx::query_as(
+        r#"
+        SELECT
+            (SELECT COUNT(*)::bigint FROM public.establecimientos WHERE organizacion_id = $1),
+            (SELECT COUNT(*)::bigint FROM public.lotes_base WHERE organizacion_id = $1),
+            (SELECT COUNT(*)::bigint FROM public.external_references WHERE organizacion_id = $1),
+            (SELECT COUNT(*)::bigint FROM public.audit_events WHERE organizacion_id = $1)
+        "#,
+    )
+    .bind(creator.organization_id)
+    .fetch_one(&db)
+    .await
+    .expect("post-preview state must be queryable");
+    assert_eq!(after, before);
 }
