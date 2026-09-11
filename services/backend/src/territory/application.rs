@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use time::Date;
+use time::{Date, OffsetDateTime};
 use uuid::Uuid;
 
 use crate::{
@@ -7,8 +7,13 @@ use crate::{
         AuthorizationContext, PermissionDenied,
         permission_codes::{TERRITORIO_CREAR, TERRITORIO_VER},
     },
+    external_references::ExternalId,
+    idempotency::{IdempotencyKey, RequestFingerprint},
     territory::{
         domain::{Establecimiento, LoteBase, NewEstablecimiento, NewLoteBase, TERRITORIAL_SRID},
+        geographic_source::{
+            ExternalSourceName, GeographicSourceFingerprint, GeographicSourceType,
+        },
         senasa::{self, NormalizedPolygon4326, SenasaPolygonParseError},
     },
 };
@@ -39,6 +44,48 @@ pub enum TerritoryPreviewStoreError {
     InvalidTopology { reason: String },
     EmptyGeometry,
     UnexpectedSrid,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GeographicSourceView {
+    pub id: Uuid,
+    pub establecimiento_id: Uuid,
+    pub external_reference_id: Uuid,
+    pub external_id: String,
+    pub source_type: GeographicSourceType,
+    pub external_name: Option<String>,
+    pub original_source_text: String,
+    pub geometry: GeoJsonMultiPolygon,
+    pub fingerprint: GeographicSourceFingerprint,
+    pub parser_version: String,
+    pub created_by: Uuid,
+    pub created_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConfirmedGeographicSource {
+    pub source: GeographicSourceView,
+    pub created: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewSenasaGeographicSource {
+    pub establecimiento_id: Uuid,
+    pub external_id: ExternalId,
+    pub external_name: Option<ExternalSourceName>,
+    pub original_source_text: String,
+    pub normalized_polygon: NormalizedPolygon4326,
+    pub fingerprint: GeographicSourceFingerprint,
+    pub idempotency_key: IdempotencyKey,
+    pub idempotency_request_fingerprint: RequestFingerprint,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TerritorySourceStoreError {
+    NotFound,
+    Conflict,
+    Validation(TerritoryPreviewStoreError),
     Unavailable,
 }
 
@@ -175,6 +222,23 @@ pub trait TerritoryPreviewStore: Send + Sync {
     ) -> Result<GeoJsonMultiPolygon, TerritoryPreviewStoreError>;
 }
 
+/// Transactional source-evidence persistence and provenance read boundary.
+#[async_trait]
+pub trait TerritorySourceStore: Send + Sync {
+    async fn confirm_senasa_source(
+        &self,
+        organization_id: Uuid,
+        actor_id: Uuid,
+        source: NewSenasaGeographicSource,
+    ) -> Result<ConfirmedGeographicSource, TerritorySourceStoreError>;
+
+    async fn list_geographic_sources(
+        &self,
+        organization_id: Uuid,
+        establecimiento_id: Uuid,
+    ) -> Result<Vec<GeographicSourceView>, TerritorySourceStoreError>;
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerritoryApplicationError {
     Validation(TerritoryValidationError),
@@ -203,6 +267,80 @@ pub async fn preview_senasa_polygon(
         geometry,
         srid: TERRITORIAL_SRID,
     })
+}
+
+pub async fn confirm_senasa_source(
+    store: &dyn TerritorySourceStore,
+    context: &AuthorizationContext,
+    establecimiento_id: Uuid,
+    external_id: String,
+    external_name: Option<String>,
+    source_text: String,
+    idempotency_key: IdempotencyKey,
+) -> Result<ConfirmedGeographicSource, TerritoryApplicationError> {
+    context
+        .require_permission(TERRITORIO_CREAR)
+        .map_err(|PermissionDenied| TerritoryApplicationError::PermissionDenied)?;
+    let external_id = ExternalId::new(external_id).map_err(|_| {
+        TerritoryApplicationError::Validation(TerritoryValidationError {
+            code: "referencia_externa_invalida",
+            message: "La referencia externa debe ser texto válido y sin espacios laterales."
+                .to_owned(),
+            detail: None,
+            line: None,
+        })
+    })?;
+    let external_name = external_name
+        .map(ExternalSourceName::new)
+        .transpose()
+        .map_err(|_| {
+            TerritoryApplicationError::Validation(TerritoryValidationError {
+                code: "nombre_externo_invalido",
+                message: "El nombre externo debe ser texto válido y sin espacios laterales."
+                    .to_owned(),
+                detail: None,
+                line: None,
+            })
+        })?;
+    let normalized_polygon =
+        senasa::parse_polygon(&source_text).map_err(parser_validation_error)?;
+    let fingerprint = GeographicSourceFingerprint::for_senasa(
+        establecimiento_id,
+        &external_id,
+        external_name.as_ref(),
+        &normalized_polygon,
+    );
+    let request_fingerprint = RequestFingerprint::sha256(fingerprint.as_bytes());
+
+    store
+        .confirm_senasa_source(
+            context.organization_id,
+            context.user_id,
+            NewSenasaGeographicSource {
+                establecimiento_id,
+                external_id,
+                external_name,
+                original_source_text: source_text,
+                normalized_polygon,
+                fingerprint,
+                idempotency_key,
+                idempotency_request_fingerprint: request_fingerprint,
+            },
+        )
+        .await
+        .map_err(map_source_store_error)
+}
+
+pub async fn list_geographic_sources(
+    store: &dyn TerritorySourceStore,
+    context: &AuthorizationContext,
+    establecimiento_id: Uuid,
+) -> Result<Vec<GeographicSourceView>, TerritoryApplicationError> {
+    require_read_permission(context)?;
+    store
+        .list_geographic_sources(context.organization_id, establecimiento_id)
+        .await
+        .map_err(map_source_store_error)
 }
 
 pub async fn list_establecimientos(
@@ -359,6 +497,15 @@ fn map_preview_store_error(error: TerritoryPreviewStoreError) -> TerritoryApplic
             })
         }
         TerritoryPreviewStoreError::Unavailable => TerritoryApplicationError::Unavailable,
+    }
+}
+
+fn map_source_store_error(error: TerritorySourceStoreError) -> TerritoryApplicationError {
+    match error {
+        TerritorySourceStoreError::NotFound => TerritoryApplicationError::NotFound,
+        TerritorySourceStoreError::Conflict => TerritoryApplicationError::Conflict,
+        TerritorySourceStoreError::Validation(error) => map_preview_store_error(error),
+        TerritorySourceStoreError::Unavailable => TerritoryApplicationError::Unavailable,
     }
 }
 

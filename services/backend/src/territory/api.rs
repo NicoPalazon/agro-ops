@@ -14,10 +14,11 @@ use uuid::Uuid;
 
 use crate::{
     AppState, RequestAccessError,
+    idempotency::IdempotencyKey,
     territory::{
         application::{
             self, BasePlotView, CampaignView, EstablishmentView, ExternalReferenceView,
-            GeoJsonMultiPolygon, OperationalUnitView, SenasaPolygonPreview,
+            GeoJsonMultiPolygon, GeographicSourceView, OperationalUnitView, SenasaPolygonPreview,
             TerritorialUseAssignmentView, TerritoryApplicationError, TerritoryValidationError,
         },
         infrastructure::PostgresTerritoryStore,
@@ -127,6 +128,39 @@ pub struct TerritorialValidationErrorResponse {
     linea: Option<usize>,
 }
 
+#[derive(Deserialize, ToSchema)]
+pub struct ConfirmSenasaGeographicSourceRequest {
+    external_id: String,
+    nombre_externo: Option<String>,
+    texto_poligono: String,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct GeographicSourceResponse {
+    #[schema(value_type = String)]
+    id: Uuid,
+    #[schema(value_type = String)]
+    establecimiento_id: Uuid,
+    #[schema(value_type = String)]
+    external_reference_id: Uuid,
+    external_id: String,
+    tipo_origen: &'static str,
+    nombre_externo: Option<String>,
+    texto_fuente_original: String,
+    geometria: GeoJsonMultiPolygonResponse,
+    huella_sha256: String,
+    version_parser: String,
+    #[schema(value_type = String)]
+    creado_por: Uuid,
+    creado_en: String,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ConfirmedGeographicSourceResponse {
+    fuente: GeographicSourceResponse,
+    creada: bool,
+}
+
 #[derive(Debug)]
 pub(crate) enum TerritoryRequestError {
     Access(RequestAccessError),
@@ -164,7 +198,7 @@ impl IntoResponse for TerritoryRequestError {
                 StatusCode::SERVICE_UNAVAILABLE.into_response()
             }
             Self::Application(TerritoryApplicationError::Conflict) => {
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                StatusCode::CONFLICT.into_response()
             }
         }
     }
@@ -191,6 +225,87 @@ pub fn routes() -> Router<AppState> {
             "/territorio/previsualizaciones/senasa-poligono",
             post(preview_senasa_polygon),
         )
+        .route(
+            "/territorio/establecimientos/{establecimiento_id}/fuentes-geograficas/senasa",
+            post(confirm_senasa_geographic_source),
+        )
+        .route(
+            "/territorio/establecimientos/{establecimiento_id}/fuentes-geograficas",
+            get(list_geographic_sources),
+        )
+}
+
+#[utoipa::path(
+    post,
+    path = "/territorio/establecimientos/{establecimiento_id}/fuentes-geograficas/senasa",
+    params(("establecimiento_id" = String, Path, description = "Agro Ops establishment UUID.")),
+    request_body = ConfirmSenasaGeographicSourceRequest,
+    security(("supabaseBearer" = [])),
+    responses(
+        (status = 201, description = "SENASA source evidence was persisted.", body = ConfirmedGeographicSourceResponse),
+        (status = 200, description = "A duplicate source or idempotent replay returned its existing evidence.", body = ConfirmedGeographicSourceResponse),
+        (status = 400, description = "The source, idempotency key, or topology is invalid.", body = TerritorialValidationErrorResponse),
+        (status = 401, description = "A valid Supabase user access token is required."),
+        (status = 403, description = "The caller lacks territorio:crear."),
+        (status = 404, description = "The establishment is not visible to the caller organization."),
+        (status = 409, description = "The external reference or idempotency key conflicts."),
+        (status = 503, description = "Authorization or territorial storage is unavailable.")
+    )
+)]
+pub(crate) async fn confirm_senasa_geographic_source(
+    State(state): State<AppState>,
+    Path(establecimiento_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(request): Json<ConfirmSenasaGeographicSourceRequest>,
+) -> Result<(StatusCode, Json<ConfirmedGeographicSourceResponse>), TerritoryRequestError> {
+    let context = crate::resolve_request_context(&state, &headers).await?;
+    let idempotency_key = source_idempotency_key(&headers)?;
+    let store = PostgresTerritoryStore::new(state.db.clone());
+    let confirmed = application::confirm_senasa_source(
+        &store,
+        &context,
+        establecimiento_id,
+        request.external_id,
+        request.nombre_externo,
+        request.texto_poligono,
+        idempotency_key,
+    )
+    .await?;
+    let status = if confirmed.created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(confirmed.into())))
+}
+
+#[utoipa::path(
+    get,
+    path = "/territorio/establecimientos/{establecimiento_id}/fuentes-geograficas",
+    params(("establecimiento_id" = String, Path, description = "Agro Ops establishment UUID.")),
+    security(("supabaseBearer" = [])),
+    responses(
+        (status = 200, description = "Individual source evidence; it is distinct from canonical establishment geometry.", body = [GeographicSourceResponse]),
+        (status = 401, description = "A valid Supabase user access token is required."),
+        (status = 403, description = "The caller lacks territorio:ver."),
+        (status = 404, description = "The establishment is not visible to the caller organization."),
+        (status = 503, description = "Authorization or territorial storage is unavailable.")
+    )
+)]
+pub(crate) async fn list_geographic_sources(
+    State(state): State<AppState>,
+    Path(establecimiento_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<GeographicSourceResponse>>, TerritoryRequestError> {
+    let context = crate::resolve_request_context(&state, &headers).await?;
+    let store = PostgresTerritoryStore::new(state.db.clone());
+    Ok(Json(
+        application::list_geographic_sources(&store, &context, establecimiento_id)
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+    ))
 }
 
 #[utoipa::path(
@@ -408,6 +523,34 @@ impl From<SenasaPolygonPreview> for SenasaPolygonPreviewResponse {
     }
 }
 
+impl From<GeographicSourceView> for GeographicSourceResponse {
+    fn from(value: GeographicSourceView) -> Self {
+        Self {
+            id: value.id,
+            establecimiento_id: value.establecimiento_id,
+            external_reference_id: value.external_reference_id,
+            external_id: value.external_id,
+            tipo_origen: value.source_type.as_str(),
+            nombre_externo: value.external_name,
+            texto_fuente_original: value.original_source_text,
+            geometria: value.geometry.into(),
+            huella_sha256: value.fingerprint.to_hex(),
+            version_parser: value.parser_version,
+            creado_por: value.created_by,
+            creado_en: value.created_at.to_string(),
+        }
+    }
+}
+
+impl From<application::ConfirmedGeographicSource> for ConfirmedGeographicSourceResponse {
+    fn from(value: application::ConfirmedGeographicSource) -> Self {
+        Self {
+            fuente: value.source.into(),
+            creada: value.created,
+        }
+    }
+}
+
 impl From<TerritoryValidationError> for TerritorialValidationErrorResponse {
     fn from(value: TerritoryValidationError) -> Self {
         Self {
@@ -417,6 +560,33 @@ impl From<TerritoryValidationError> for TerritorialValidationErrorResponse {
             linea: value.line,
         }
     }
+}
+
+fn source_idempotency_key(headers: &HeaderMap) -> Result<IdempotencyKey, TerritoryRequestError> {
+    let key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| {
+            TerritoryRequestError::Application(TerritoryApplicationError::Validation(
+                TerritoryValidationError {
+                    code: "idempotency_key_requerida",
+                    message: "Se requiere el encabezado Idempotency-Key para confirmar una fuente."
+                        .to_owned(),
+                    detail: None,
+                    line: None,
+                },
+            ))
+        })?;
+    IdempotencyKey::new(key.to_owned()).map_err(|_| {
+        TerritoryRequestError::Application(TerritoryApplicationError::Validation(
+            TerritoryValidationError {
+                code: "idempotency_key_invalida",
+                message: "El encabezado Idempotency-Key no es válido.".to_owned(),
+                detail: None,
+                line: None,
+            },
+        ))
+    })
 }
 
 impl From<ExternalReferenceView> for ExternalReferenceResponse {
