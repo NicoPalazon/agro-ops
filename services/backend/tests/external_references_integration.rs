@@ -350,13 +350,29 @@ async fn database_constraints_and_restrictive_organization_history_are_enforced(
     let truncate_references = sqlx::query("TRUNCATE TABLE external_references")
         .execute(&db)
         .await
-        .expect_err("external identity history must not be truncated");
+        .expect_err("referenced external references must not be truncated");
     assert_eq!(
         truncate_references
             .as_database_error()
             .and_then(|error| error.code())
             .as_deref(),
-        Some("P0001")
+        Some("0A000")
+    );
+
+    // Including the direct FK dependent table lets PostgreSQL reach the ExternalReference
+    // trigger; the exact message excludes fuentes_geograficas' own truncate trigger.
+    let truncate_references_with_geographic_sources =
+        sqlx::query("TRUNCATE TABLE external_references, fuentes_geograficas")
+            .execute(&db)
+            .await
+            .expect_err("external identity history must not be truncated");
+    let truncate_error = truncate_references_with_geographic_sources
+        .as_database_error()
+        .expect("truncate failure must be a database error");
+    assert_eq!(truncate_error.code().as_deref(), Some("P0001"));
+    assert_eq!(
+        truncate_error.message(),
+        "agro_ops_external_reference_truncate_prohibido"
     );
     let delete_organization = sqlx::query("DELETE FROM organizaciones WHERE id = $1")
         .bind(organization_id)
