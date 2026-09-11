@@ -19,6 +19,10 @@ use uuid::Uuid;
 const FIELD: &str = "MULTIPOLYGON(((-60 -34, -60 -34.1, -59.9 -34.1, -59.9 -34, -60 -34)),((-59.8 -34, -59.8 -34.1, -59.7 -34.1, -59.7 -34, -59.8 -34)))";
 const BASE_A: &str = "POLYGON((-60 -34, -60 -34.1, -59.95 -34.1, -59.95 -34, -60 -34))";
 const BASE_B: &str = "POLYGON((-59.8 -34, -59.8 -34.1, -59.75 -34.1, -59.75 -34, -59.8 -34))";
+const SOURCE_A: &str = "-34, -60\n-34.01, -60\n-34.01, -59.99\n-34, -59.99\n-34, -60";
+const SOURCE_B: &str = "-34, -59.98\n-34.01, -59.98\n-34.01, -59.97\n-34, -59.97\n-34, -59.98";
+const SOURCE_OVERLAP: &str =
+    "-34, -59.995\n-34.01, -59.995\n-34.01, -59.985\n-34, -59.985\n-34, -59.995";
 
 #[derive(Clone, Copy)]
 struct Principal {
@@ -34,6 +38,8 @@ struct TerritoryFixture {
     campaign_id: Uuid,
     operational_unit_id: Uuid,
 }
+
+type GeographicSourceEvidenceSnapshot = (Uuid, Vec<u8>, String, Vec<u8>, Uuid);
 
 struct TestVerifier;
 
@@ -331,6 +337,51 @@ async fn json_body(response: axum::response::Response) -> Value {
             .expect("response body must read"),
     )
     .expect("response must be JSON")
+}
+
+async fn create_grouping_establishment(db: &PgPool, principal: Principal, code: &str) -> Uuid {
+    sqlx::query_scalar(
+        r#"
+        INSERT INTO public.establecimientos (
+            organizacion_id, codigo, nombre, geometria, origen_geometria, creado_por
+        )
+        VALUES (
+            $1, $2, 'Campo para agrupación',
+            ST_Multi(ST_GeomFromText('POLYGON((-60 -34, -60 -34.01, -59.99 -34.01, -59.99 -34, -60 -34))', 4326)),
+            'manual', $3
+        )
+        RETURNING id
+        "#,
+    )
+    .bind(principal.organization_id)
+    .bind(code)
+    .bind(principal.user_id)
+    .fetch_one(db)
+    .await
+    .expect("grouping establishment must insert")
+}
+
+async fn import_senasa_source(
+    db: &PgPool,
+    principal: Principal,
+    establecimiento_id: Uuid,
+    external_id: &str,
+    source_text: &str,
+    idempotency_key: &str,
+) -> Uuid {
+    let imported = post_json_with_idempotency(
+        state(db.clone()),
+        &format!("/territorio/establecimientos/{establecimiento_id}/fuentes-geograficas/senasa"),
+        Some(principal.subject),
+        serde_json::json!({
+            "external_id": external_id,
+            "texto_poligono": source_text,
+        }),
+        idempotency_key,
+    )
+    .await;
+    assert_eq!(imported.status(), StatusCode::CREATED);
+    Uuid::parse_str(json_body(imported).await["fuente"]["id"].as_str().unwrap()).unwrap()
 }
 
 #[tokio::test]
@@ -929,4 +980,506 @@ async fn senasa_geographic_sources_are_immutable_provenance_and_never_replace_ca
     )
     .await;
     assert_eq!(cross_organization.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn confirmed_sources_define_exact_canonical_union_with_atomic_replacement_and_scope() {
+    let _guard = database_test_lock().lock().await;
+    let db = test_pool().await;
+    let creator = principal(&db, &["territorio:crear", "territorio:ver"]).await;
+    let establishment_id = create_grouping_establishment(&db, creator, "AGRUPACION").await;
+    let grouping_path =
+        format!("/territorio/establecimientos/{establishment_id}/fuentes-geograficas-confirmadas");
+    let source_a = import_senasa_source(
+        &db,
+        creator,
+        establishment_id,
+        "RENSPA-AGRUPACION-A",
+        SOURCE_A,
+        "grouping-import-a",
+    )
+    .await;
+    let source_b = import_senasa_source(
+        &db,
+        creator,
+        establishment_id,
+        "RENSPA-AGRUPACION-B",
+        SOURCE_B,
+        "grouping-import-b",
+    )
+    .await;
+    let source_overlap = import_senasa_source(
+        &db,
+        creator,
+        establishment_id,
+        "RENSPA-AGRUPACION-SUPERPUESTA",
+        SOURCE_OVERLAP,
+        "grouping-import-overlap",
+    )
+    .await;
+    let evidence_before: Vec<GeographicSourceEvidenceSnapshot> = sqlx::query_as(
+        r#"
+        SELECT id, ST_AsEWKB(geometria), texto_fuente_original, huella_sha256,
+               external_reference_id
+        FROM public.fuentes_geograficas
+        WHERE id = ANY($1::uuid[])
+        ORDER BY id
+        "#,
+    )
+    .bind([source_a, source_b, source_overlap])
+    .fetch_all(&db)
+    .await
+    .expect("source evidence snapshot must be readable");
+    let references_before: Vec<(Uuid, String, Uuid)> = sqlx::query_as(
+        r#"
+        SELECT id, external_id, entidad_id
+        FROM public.external_references
+        WHERE organizacion_id = $1
+          AND external_id = ANY($2::text[])
+        ORDER BY id
+        "#,
+    )
+    .bind(creator.organization_id)
+    .bind([
+        "RENSPA-AGRUPACION-A",
+        "RENSPA-AGRUPACION-B",
+        "RENSPA-AGRUPACION-SUPERPUESTA",
+    ])
+    .fetch_all(&db)
+    .await
+    .expect("external reference snapshot must be readable");
+
+    let one_source_body = serde_json::json!({ "fuente_geografica_ids": [source_a] });
+    assert_eq!(
+        post_json_with_idempotency(
+            state(db.clone()),
+            &grouping_path,
+            None,
+            one_source_body.clone(),
+            "grouping-unauthenticated",
+        )
+        .await
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let denied = principal(&db, &[]).await;
+    assert_eq!(
+        post_json_with_idempotency(
+            state(db.clone()),
+            &grouping_path,
+            Some(denied.subject),
+            one_source_body.clone(),
+            "grouping-forbidden",
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    let duplicate_selection = post_json_with_idempotency(
+        state(db.clone()),
+        &grouping_path,
+        Some(creator.subject),
+        serde_json::json!({ "fuente_geografica_ids": [source_a, source_a] }),
+        "grouping-duplicate-selection",
+    )
+    .await;
+    assert_eq!(duplicate_selection.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_body(duplicate_selection).await["codigo"],
+        "fuente_confirmada_duplicada"
+    );
+    let empty_selection = post_json_with_idempotency(
+        state(db.clone()),
+        &grouping_path,
+        Some(creator.subject),
+        serde_json::json!({ "fuente_geografica_ids": [] }),
+        "grouping-empty-selection",
+    )
+    .await;
+    assert_eq!(empty_selection.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_body(empty_selection).await["codigo"],
+        "fuentes_confirmadas_requeridas"
+    );
+
+    let one_source = post_json_with_idempotency(
+        state(db.clone()),
+        &grouping_path,
+        Some(creator.subject),
+        one_source_body,
+        "grouping-one-source",
+    )
+    .await;
+    assert_eq!(one_source.status(), StatusCode::OK);
+    let one_source = json_body(one_source).await;
+    assert_eq!(one_source["actualizada"], true);
+    assert_eq!(one_source["superposicion_detectada"], false);
+    assert_eq!(one_source["geometria_canonica"]["type"], "MultiPolygon");
+    let canonical_one: (bool, String, i32) = sqlx::query_as(
+        r#"
+        SELECT ST_Equals(establecimiento.geometria, fuente.geometria),
+               GeometryType(establecimiento.geometria), ST_SRID(establecimiento.geometria)
+        FROM public.establecimientos AS establecimiento
+        JOIN public.fuentes_geograficas AS fuente ON fuente.id = $2
+        WHERE establecimiento.id = $1
+        "#,
+    )
+    .bind(establishment_id)
+    .bind(source_a)
+    .fetch_one(&db)
+    .await
+    .expect("single-source canonical geometry must be readable");
+    assert_eq!(canonical_one, (true, "MULTIPOLYGON".to_owned(), 4326));
+
+    let establishment_read = response(
+        state(db.clone()),
+        &format!("/territorio/establecimientos/{establishment_id}"),
+        Some(creator.subject),
+    )
+    .await;
+    assert_eq!(establishment_read.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(establishment_read).await["geometria"],
+        one_source["geometria_canonica"]
+    );
+
+    let disjoint = post_json_with_idempotency(
+        state(db.clone()),
+        &grouping_path,
+        Some(creator.subject),
+        serde_json::json!({ "fuente_geografica_ids": [source_a, source_b] }),
+        "grouping-disjoint",
+    )
+    .await;
+    assert_eq!(disjoint.status(), StatusCode::OK);
+    let disjoint = json_body(disjoint).await;
+    assert_eq!(disjoint["actualizada"], true);
+    assert_eq!(disjoint["superposicion_detectada"], false);
+    let disjoint_geometry: (bool, String, i32, i32, bool, bool) = sqlx::query_as(
+        r#"
+        SELECT ST_Equals(
+                   establecimiento.geometria,
+                   (SELECT ST_Multi(ST_UnaryUnion(ST_Collect(geometria)))
+                    FROM public.fuentes_geograficas WHERE id = ANY($2::uuid[]))
+               ),
+               GeometryType(establecimiento.geometria),
+               ST_SRID(establecimiento.geometria),
+               ST_NumGeometries(establecimiento.geometria),
+               NOT ST_Covers(
+                   establecimiento.geometria,
+                   ST_SetSRID(ST_Point(-59.985, -34.005), 4326)
+               ),
+               ST_Area(ST_ConvexHull(establecimiento.geometria)::geography)
+                   > ST_Area(establecimiento.geometria::geography)
+        FROM public.establecimientos AS establecimiento
+        WHERE id = $1
+        "#,
+    )
+    .bind(establishment_id)
+    .bind([source_a, source_b])
+    .fetch_one(&db)
+    .await
+    .expect("disconnected canonical geometry must be readable");
+    assert_eq!(
+        disjoint_geometry,
+        (true, "MULTIPOLYGON".to_owned(), 4326, 2, true, true)
+    );
+    let excludes_unselected_overlap: bool = sqlx::query_scalar(
+        r#"
+        SELECT NOT ST_Covers(
+            geometria,
+            ST_SetSRID(ST_Point(-59.987, -34.005), 4326)
+        )
+        FROM public.establecimientos WHERE id = $1
+        "#,
+    )
+    .bind(establishment_id)
+    .fetch_one(&db)
+    .await
+    .expect("explicit contributor geometry must be queryable");
+    assert!(excludes_unselected_overlap);
+
+    let disjoint_same_key_replay = post_json_with_idempotency(
+        state(db.clone()),
+        &grouping_path,
+        Some(creator.subject),
+        serde_json::json!({ "fuente_geografica_ids": [source_b, source_a] }),
+        "grouping-disjoint",
+    )
+    .await;
+    assert_eq!(disjoint_same_key_replay.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(disjoint_same_key_replay).await["actualizada"],
+        true
+    );
+    let disjoint_retry = post_json_with_idempotency(
+        state(db.clone()),
+        &grouping_path,
+        Some(creator.subject),
+        serde_json::json!({ "fuente_geografica_ids": [source_b, source_a] }),
+        "grouping-disjoint-semantic-retry",
+    )
+    .await;
+    assert_eq!(disjoint_retry.status(), StatusCode::OK);
+    assert_eq!(json_body(disjoint_retry).await["actualizada"], false);
+    let audit_after_disjoint: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM public.audit_events WHERE organizacion_id = $1 AND accion = 'establecimiento.fuentes_geograficas_confirmadas'",
+    )
+    .bind(creator.organization_id)
+    .fetch_one(&db)
+    .await
+    .expect("grouping audit count must be readable");
+    assert_eq!(audit_after_disjoint, 2);
+
+    let overlapping = post_json_with_idempotency(
+        state(db.clone()),
+        &grouping_path,
+        Some(creator.subject),
+        serde_json::json!({ "fuente_geografica_ids": [source_a, source_overlap] }),
+        "grouping-overlap",
+    )
+    .await;
+    assert_eq!(overlapping.status(), StatusCode::OK);
+    let overlapping = json_body(overlapping).await;
+    assert_eq!(overlapping["superposicion_detectada"], true);
+    assert!(overlapping["area_superpuesta_m2"].as_f64().unwrap() > 0.0);
+    assert!(
+        overlapping["area_fuentes_m2"].as_f64().unwrap()
+            > overlapping["area_canonica_m2"].as_f64().unwrap()
+    );
+    let exact_overlap_union: bool = sqlx::query_scalar(
+        r#"
+        SELECT ST_Equals(
+            geometria,
+            (SELECT ST_Multi(ST_UnaryUnion(ST_Collect(geometria)))
+             FROM public.fuentes_geograficas WHERE id = ANY($2::uuid[]))
+        )
+        FROM public.establecimientos WHERE id = $1
+        "#,
+    )
+    .bind(establishment_id)
+    .bind([source_a, source_overlap])
+    .fetch_one(&db)
+    .await
+    .expect("overlap union must be queryable");
+    assert!(exact_overlap_union);
+
+    let replace_with_b = post_json_with_idempotency(
+        state(db.clone()),
+        &grouping_path,
+        Some(creator.subject),
+        serde_json::json!({ "fuente_geografica_ids": [source_b] }),
+        "grouping-replace-with-b",
+    )
+    .await;
+    assert_eq!(replace_with_b.status(), StatusCode::OK);
+    assert_eq!(json_body(replace_with_b).await["actualizada"], true);
+    let replacement_state: (i64, bool) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*)::bigint, bool_and(
+            contribucion.fuente_geografica_id = $2
+            AND ST_Equals(establecimiento.geometria, fuente.geometria)
+        )
+        FROM public.fuentes_geograficas_contribuciones_canonicas AS contribucion
+        JOIN public.establecimientos AS establecimiento
+          ON establecimiento.id = contribucion.establecimiento_id
+        JOIN public.fuentes_geograficas AS fuente
+          ON fuente.id = contribucion.fuente_geografica_id
+        WHERE contribucion.establecimiento_id = $1
+        "#,
+    )
+    .bind(establishment_id)
+    .bind(source_b)
+    .fetch_one(&db)
+    .await
+    .expect("replacement contributor state must be readable");
+    assert_eq!(replacement_state, (1, true));
+    let audit_before_replays: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM public.audit_events WHERE organizacion_id = $1 AND accion = 'establecimiento.fuentes_geograficas_confirmadas'",
+    )
+    .bind(creator.organization_id)
+    .fetch_one(&db)
+    .await
+    .expect("audit count before replay must be readable");
+    let same_key_replay = post_json_with_idempotency(
+        state(db.clone()),
+        &grouping_path,
+        Some(creator.subject),
+        serde_json::json!({ "fuente_geografica_ids": [source_b] }),
+        "grouping-replace-with-b",
+    )
+    .await;
+    assert_eq!(same_key_replay.status(), StatusCode::OK);
+    assert_eq!(json_body(same_key_replay).await["actualizada"], true);
+    let semantic_replay = post_json_with_idempotency(
+        state(db.clone()),
+        &grouping_path,
+        Some(creator.subject),
+        serde_json::json!({ "fuente_geografica_ids": [source_b] }),
+        "grouping-replace-with-b-semantic-retry",
+    )
+    .await;
+    assert_eq!(semantic_replay.status(), StatusCode::OK);
+    assert_eq!(json_body(semantic_replay).await["actualizada"], false);
+    let audit_after_replays: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM public.audit_events WHERE organizacion_id = $1 AND accion = 'establecimiento.fuentes_geograficas_confirmadas'",
+    )
+    .bind(creator.organization_id)
+    .fetch_one(&db)
+    .await
+    .expect("audit count after replay must be readable");
+    assert_eq!(audit_after_replays, audit_before_replays);
+
+    let provenance = response(
+        state(db.clone()),
+        &format!("/territorio/establecimientos/{establishment_id}/fuentes-geograficas"),
+        Some(creator.subject),
+    )
+    .await;
+    assert_eq!(provenance.status(), StatusCode::OK);
+    let provenance = json_body(provenance).await;
+    let confirmed = provenance
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|source| source["confirmada_para_geometria_canonica"] == true)
+        .collect::<Vec<_>>();
+    assert_eq!(confirmed.len(), 1);
+    assert_eq!(confirmed[0]["id"], source_b.to_string());
+    assert_eq!(confirmed[0]["confirmada_por"], creator.user_id.to_string());
+
+    let evidence_after: Vec<GeographicSourceEvidenceSnapshot> = sqlx::query_as(
+        r#"
+        SELECT id, ST_AsEWKB(geometria), texto_fuente_original, huella_sha256,
+               external_reference_id
+        FROM public.fuentes_geograficas
+        WHERE id = ANY($1::uuid[])
+        ORDER BY id
+        "#,
+    )
+    .bind([source_a, source_b, source_overlap])
+    .fetch_all(&db)
+    .await
+    .expect("source evidence must remain readable");
+    assert_eq!(evidence_after, evidence_before);
+    let references_after: Vec<(Uuid, String, Uuid)> = sqlx::query_as(
+        r#"
+        SELECT id, external_id, entidad_id
+        FROM public.external_references
+        WHERE organizacion_id = $1
+          AND external_id = ANY($2::text[])
+        ORDER BY id
+        "#,
+    )
+    .bind(creator.organization_id)
+    .bind([
+        "RENSPA-AGRUPACION-A",
+        "RENSPA-AGRUPACION-B",
+        "RENSPA-AGRUPACION-SUPERPUESTA",
+    ])
+    .fetch_all(&db)
+    .await
+    .expect("external references must remain readable");
+    assert_eq!(references_after, references_before);
+
+    let same_organization_other_establishment =
+        create_grouping_establishment(&db, creator, "OTRO_CAMPO").await;
+    let other_establishment_source = import_senasa_source(
+        &db,
+        creator,
+        same_organization_other_establishment,
+        "RENSPA-OTRO-CAMPO",
+        SOURCE_A,
+        "grouping-import-other-establishment",
+    )
+    .await;
+    let wrong_establishment = post_json_with_idempotency(
+        state(db.clone()),
+        &grouping_path,
+        Some(creator.subject),
+        serde_json::json!({ "fuente_geografica_ids": [other_establishment_source] }),
+        "grouping-wrong-establishment",
+    )
+    .await;
+    assert_eq!(wrong_establishment.status(), StatusCode::NOT_FOUND);
+
+    let other_organization = principal(&db, &["territorio:crear"]).await;
+    let other_organization_establishment =
+        create_grouping_establishment(&db, other_organization, "AGRUPACION").await;
+    let other_organization_source = import_senasa_source(
+        &db,
+        other_organization,
+        other_organization_establishment,
+        "RENSPA-OTRA-ORGANIZACION",
+        SOURCE_A,
+        "grouping-import-other-organization",
+    )
+    .await;
+    let cross_organization = post_json_with_idempotency(
+        state(db.clone()),
+        &grouping_path,
+        Some(creator.subject),
+        serde_json::json!({ "fuente_geografica_ids": [other_organization_source] }),
+        "grouping-cross-organization",
+    )
+    .await;
+    assert_eq!(cross_organization.status(), StatusCode::NOT_FOUND);
+
+    let inconsistent_direct_link = sqlx::query(
+        r#"
+        INSERT INTO public.fuentes_geograficas_contribuciones_canonicas (
+            organizacion_id, establecimiento_id, fuente_geografica_id, confirmado_por
+        ) VALUES ($1, $2, $3, $4)
+        "#,
+    )
+    .bind(creator.organization_id)
+    .bind(establishment_id)
+    .bind(other_establishment_source)
+    .bind(creator.user_id)
+    .execute(&db)
+    .await
+    .expect_err("database must reject a source from another establishment");
+    assert_eq!(
+        inconsistent_direct_link
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("23503")
+    );
+
+    let (concurrent_a, concurrent_overlap) = tokio::join!(
+        post_json_with_idempotency(
+            state(db.clone()),
+            &grouping_path,
+            Some(creator.subject),
+            serde_json::json!({ "fuente_geografica_ids": [source_a] }),
+            "grouping-concurrent-a",
+        ),
+        post_json_with_idempotency(
+            state(db.clone()),
+            &grouping_path,
+            Some(creator.subject),
+            serde_json::json!({ "fuente_geografica_ids": [source_overlap] }),
+            "grouping-concurrent-overlap",
+        )
+    );
+    assert_eq!(concurrent_a.status(), StatusCode::OK);
+    assert_eq!(concurrent_overlap.status(), StatusCode::OK);
+    let final_state: (i64, bool) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*)::bigint,
+               bool_and(ST_Equals(establecimiento.geometria, fuente.geometria))
+        FROM public.fuentes_geograficas_contribuciones_canonicas AS contribucion
+        JOIN public.establecimientos AS establecimiento
+          ON establecimiento.id = contribucion.establecimiento_id
+        JOIN public.fuentes_geograficas AS fuente
+          ON fuente.id = contribucion.fuente_geografica_id
+        WHERE contribucion.establecimiento_id = $1
+        "#,
+    )
+    .bind(establishment_id)
+    .fetch_one(&db)
+    .await
+    .expect("final concurrent grouping state must be readable");
+    assert_eq!(final_state, (1, true));
 }

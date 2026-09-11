@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use serde_json::json;
 use time::{Date, OffsetDateTime};
 use uuid::Uuid;
 
@@ -15,6 +16,7 @@ use crate::{
             ExternalSourceName, GeographicSourceFingerprint, GeographicSourceType,
         },
         senasa::{self, NormalizedPolygon4326, SenasaPolygonParseError},
+        source_grouping::{ConfirmedSourceSet, InvalidConfirmedSourceSet},
     },
 };
 
@@ -61,6 +63,9 @@ pub struct GeographicSourceView {
     pub parser_version: String,
     pub created_by: Uuid,
     pub created_at: OffsetDateTime,
+    pub confirmed_for_canonical_geometry: bool,
+    pub confirmed_by: Option<Uuid>,
+    pub confirmed_at: Option<OffsetDateTime>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -81,11 +86,38 @@ pub struct NewSenasaGeographicSource {
     pub idempotency_request_fingerprint: RequestFingerprint,
 }
 
+#[derive(Clone, Debug)]
+pub struct NewCanonicalSourceGrouping {
+    pub establecimiento_id: Uuid,
+    pub contributors: ConfirmedSourceSet,
+    pub idempotency_key: IdempotencyKey,
+    pub idempotency_request_fingerprint: RequestFingerprint,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CanonicalSourceGrouping {
+    pub establecimiento_id: Uuid,
+    pub source_ids: Vec<Uuid>,
+    pub geometry: GeoJsonMultiPolygon,
+    pub sources_area_m2: f64,
+    pub canonical_area_m2: f64,
+    pub overlap_area_m2: f64,
+    pub overlap_detected: bool,
+    pub updated: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerritorySourceStoreError {
     NotFound,
     Conflict,
     Validation(TerritoryPreviewStoreError),
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TerritorySourceGroupingStoreError {
+    NotFound,
+    Conflict,
     Unavailable,
 }
 
@@ -239,6 +271,18 @@ pub trait TerritorySourceStore: Send + Sync {
     ) -> Result<Vec<GeographicSourceView>, TerritorySourceStoreError>;
 }
 
+/// Transactional boundary for the explicit current contributor set and its
+/// PostGIS-derived canonical establishment geometry.
+#[async_trait]
+pub trait TerritorySourceGroupingStore: Send + Sync {
+    async fn set_canonical_source_contributors(
+        &self,
+        organization_id: Uuid,
+        actor_id: Uuid,
+        grouping: NewCanonicalSourceGrouping,
+    ) -> Result<CanonicalSourceGrouping, TerritorySourceGroupingStoreError>;
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerritoryApplicationError {
     Validation(TerritoryValidationError),
@@ -341,6 +385,38 @@ pub async fn list_geographic_sources(
         .list_geographic_sources(context.organization_id, establecimiento_id)
         .await
         .map_err(map_source_store_error)
+}
+
+pub async fn set_canonical_source_contributors(
+    store: &dyn TerritorySourceGroupingStore,
+    context: &AuthorizationContext,
+    establecimiento_id: Uuid,
+    source_ids: Vec<Uuid>,
+    idempotency_key: IdempotencyKey,
+) -> Result<CanonicalSourceGrouping, TerritoryApplicationError> {
+    context
+        .require_permission(TERRITORIO_CREAR)
+        .map_err(|PermissionDenied| TerritoryApplicationError::PermissionDenied)?;
+    let contributors = ConfirmedSourceSet::new(source_ids).map_err(grouping_validation_error)?;
+    let canonical_request = serde_json::to_vec(&json!({
+        "establecimiento_id": establecimiento_id,
+        "fuente_geografica_ids": contributors.source_ids(),
+    }))
+    .expect("canonical source-grouping request serialization must succeed");
+
+    store
+        .set_canonical_source_contributors(
+            context.organization_id,
+            context.user_id,
+            NewCanonicalSourceGrouping {
+                establecimiento_id,
+                contributors,
+                idempotency_key,
+                idempotency_request_fingerprint: RequestFingerprint::sha256(&canonical_request),
+            },
+        )
+        .await
+        .map_err(map_source_grouping_store_error)
 }
 
 pub async fn list_establecimientos(
@@ -506,6 +582,39 @@ fn map_source_store_error(error: TerritorySourceStoreError) -> TerritoryApplicat
         TerritorySourceStoreError::Conflict => TerritoryApplicationError::Conflict,
         TerritorySourceStoreError::Validation(error) => map_preview_store_error(error),
         TerritorySourceStoreError::Unavailable => TerritoryApplicationError::Unavailable,
+    }
+}
+
+fn grouping_validation_error(error: InvalidConfirmedSourceSet) -> TerritoryApplicationError {
+    let (code, message) = match error {
+        InvalidConfirmedSourceSet::Empty => (
+            "fuentes_confirmadas_requeridas",
+            "Debe confirmar al menos una fuente geográfica.",
+        ),
+        InvalidConfirmedSourceSet::TooMany => (
+            "demasiadas_fuentes_confirmadas",
+            "La cantidad de fuentes geográficas supera el límite permitido.",
+        ),
+        InvalidConfirmedSourceSet::Duplicate => (
+            "fuente_confirmada_duplicada",
+            "Cada fuente geográfica debe aparecer una sola vez.",
+        ),
+    };
+    TerritoryApplicationError::Validation(TerritoryValidationError {
+        code,
+        message: message.to_owned(),
+        detail: None,
+        line: None,
+    })
+}
+
+fn map_source_grouping_store_error(
+    error: TerritorySourceGroupingStoreError,
+) -> TerritoryApplicationError {
+    match error {
+        TerritorySourceGroupingStoreError::NotFound => TerritoryApplicationError::NotFound,
+        TerritorySourceGroupingStoreError::Conflict => TerritoryApplicationError::Conflict,
+        TerritorySourceGroupingStoreError::Unavailable => TerritoryApplicationError::Unavailable,
     }
 }
 

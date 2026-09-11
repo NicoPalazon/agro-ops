@@ -17,9 +17,10 @@ use crate::{
     idempotency::IdempotencyKey,
     territory::{
         application::{
-            self, BasePlotView, CampaignView, EstablishmentView, ExternalReferenceView,
-            GeoJsonMultiPolygon, GeographicSourceView, OperationalUnitView, SenasaPolygonPreview,
-            TerritorialUseAssignmentView, TerritoryApplicationError, TerritoryValidationError,
+            self, BasePlotView, CampaignView, CanonicalSourceGrouping, EstablishmentView,
+            ExternalReferenceView, GeoJsonMultiPolygon, GeographicSourceView, OperationalUnitView,
+            SenasaPolygonPreview, TerritorialUseAssignmentView, TerritoryApplicationError,
+            TerritoryValidationError,
         },
         infrastructure::PostgresTerritoryStore,
     },
@@ -153,12 +154,36 @@ pub struct GeographicSourceResponse {
     #[schema(value_type = String)]
     creado_por: Uuid,
     creado_en: String,
+    confirmada_para_geometria_canonica: bool,
+    #[schema(value_type = Option<String>)]
+    confirmada_por: Option<Uuid>,
+    confirmada_en: Option<String>,
 }
 
 #[derive(Serialize, ToSchema)]
 pub struct ConfirmedGeographicSourceResponse {
     fuente: GeographicSourceResponse,
     creada: bool,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct SetCanonicalSourceContributorsRequest {
+    #[schema(value_type = Vec<String>)]
+    fuente_geografica_ids: Vec<Uuid>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct CanonicalSourceGroupingResponse {
+    #[schema(value_type = String)]
+    establecimiento_id: Uuid,
+    #[schema(value_type = Vec<String>)]
+    fuente_geografica_ids: Vec<Uuid>,
+    geometria_canonica: GeoJsonMultiPolygonResponse,
+    area_fuentes_m2: f64,
+    area_canonica_m2: f64,
+    area_superpuesta_m2: f64,
+    superposicion_detectada: bool,
+    actualizada: bool,
 }
 
 #[derive(Debug)]
@@ -233,6 +258,10 @@ pub fn routes() -> Router<AppState> {
             "/territorio/establecimientos/{establecimiento_id}/fuentes-geograficas",
             get(list_geographic_sources),
         )
+        .route(
+            "/territorio/establecimientos/{establecimiento_id}/fuentes-geograficas-confirmadas",
+            post(set_canonical_source_contributors),
+        )
 }
 
 #[utoipa::path(
@@ -306,6 +335,44 @@ pub(crate) async fn list_geographic_sources(
             .map(Into::into)
             .collect(),
     ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/territorio/establecimientos/{establecimiento_id}/fuentes-geograficas-confirmadas",
+    params(("establecimiento_id" = String, Path, description = "Agro Ops establishment UUID.")),
+    request_body = SetCanonicalSourceContributorsRequest,
+    security(("supabaseBearer" = [])),
+    responses(
+        (status = 200, description = "The explicit contributor set and exact canonical union were applied atomically.", body = CanonicalSourceGroupingResponse),
+        (status = 400, description = "The contributor set or idempotency key is invalid.", body = TerritorialValidationErrorResponse),
+        (status = 401, description = "A valid Supabase user access token is required."),
+        (status = 403, description = "The caller lacks territorio:crear."),
+        (status = 404, description = "The establishment or a selected source is outside the caller scope."),
+        (status = 409, description = "The grouping conflicts with current territorial invariants or idempotency."),
+        (status = 503, description = "Territorial storage is unavailable.")
+    )
+)]
+pub(crate) async fn set_canonical_source_contributors(
+    State(state): State<AppState>,
+    Path(establecimiento_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(request): Json<SetCanonicalSourceContributorsRequest>,
+) -> Result<Json<CanonicalSourceGroupingResponse>, TerritoryRequestError> {
+    let context = crate::resolve_request_context(&state, &headers).await?;
+    let idempotency_key = grouping_idempotency_key(&headers)?;
+    let store = PostgresTerritoryStore::new(state.db.clone());
+    application::set_canonical_source_contributors(
+        &store,
+        &context,
+        establecimiento_id,
+        request.fuente_geografica_ids,
+        idempotency_key,
+    )
+    .await
+    .map(CanonicalSourceGroupingResponse::from)
+    .map(Json)
+    .map_err(Into::into)
 }
 
 #[utoipa::path(
@@ -538,6 +605,9 @@ impl From<GeographicSourceView> for GeographicSourceResponse {
             version_parser: value.parser_version,
             creado_por: value.created_by,
             creado_en: value.created_at.to_string(),
+            confirmada_para_geometria_canonica: value.confirmed_for_canonical_geometry,
+            confirmada_por: value.confirmed_by,
+            confirmada_en: value.confirmed_at.map(|timestamp| timestamp.to_string()),
         }
     }
 }
@@ -547,6 +617,21 @@ impl From<application::ConfirmedGeographicSource> for ConfirmedGeographicSourceR
         Self {
             fuente: value.source.into(),
             creada: value.created,
+        }
+    }
+}
+
+impl From<CanonicalSourceGrouping> for CanonicalSourceGroupingResponse {
+    fn from(value: CanonicalSourceGrouping) -> Self {
+        Self {
+            establecimiento_id: value.establecimiento_id,
+            fuente_geografica_ids: value.source_ids,
+            geometria_canonica: value.geometry.into(),
+            area_fuentes_m2: value.sources_area_m2,
+            area_canonica_m2: value.canonical_area_m2,
+            area_superpuesta_m2: value.overlap_area_m2,
+            superposicion_detectada: value.overlap_detected,
+            actualizada: value.updated,
         }
     }
 }
@@ -563,6 +648,23 @@ impl From<TerritoryValidationError> for TerritorialValidationErrorResponse {
 }
 
 fn source_idempotency_key(headers: &HeaderMap) -> Result<IdempotencyKey, TerritoryRequestError> {
+    required_idempotency_key(
+        headers,
+        "Se requiere el encabezado Idempotency-Key para confirmar una fuente.",
+    )
+}
+
+fn grouping_idempotency_key(headers: &HeaderMap) -> Result<IdempotencyKey, TerritoryRequestError> {
+    required_idempotency_key(
+        headers,
+        "Se requiere el encabezado Idempotency-Key para confirmar la agrupación.",
+    )
+}
+
+fn required_idempotency_key(
+    headers: &HeaderMap,
+    required_message: &'static str,
+) -> Result<IdempotencyKey, TerritoryRequestError> {
     let key = headers
         .get("idempotency-key")
         .and_then(|value| value.to_str().ok())
@@ -570,8 +672,7 @@ fn source_idempotency_key(headers: &HeaderMap) -> Result<IdempotencyKey, Territo
             TerritoryRequestError::Application(TerritoryApplicationError::Validation(
                 TerritoryValidationError {
                     code: "idempotency_key_requerida",
-                    message: "Se requiere el encabezado Idempotency-Key para confirmar una fuente."
-                        .to_owned(),
+                    message: required_message.to_owned(),
                     detail: None,
                     line: None,
                 },
