@@ -19,6 +19,7 @@ pub const SENASA_RENSPA_SOURCE_TYPE: &str = "senasa_renspa";
 pub const SENASA_PARSER_VERSION: &str = "senasa_pasted_polygon_v1";
 pub const MANUAL_SOURCE_TYPE: &str = "manual";
 pub const IMPORTED_SOURCE_TYPE: &str = "importada";
+pub const CORRECTION_PARSER_VERSION: &str = "territory_correction_geojson_v1";
 const MAX_EXTERNAL_NAME_LENGTH: usize = 255;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,6 +112,20 @@ impl GeographicSourceFingerprint {
         });
         let bytes = serde_json::to_vec(&canonical)
             .expect("canonical geographic-source fingerprint serialization must succeed");
+        Self(Sha256::digest(bytes).into())
+    }
+
+    pub fn for_correction(
+        replaced_source_id: Uuid,
+        geometry: &NormalizedGeoJsonMultiPolygon,
+    ) -> Self {
+        let canonical = json!({
+            "reemplaza_fuente_geografica_id": replaced_source_id,
+            "version_parser": CORRECTION_PARSER_VERSION,
+            "geometria_normalizada": geometry.as_geojson(),
+        });
+        let bytes = serde_json::to_vec(&canonical)
+            .expect("canonical geographic correction fingerprint serialization must succeed");
         Self(Sha256::digest(bytes).into())
     }
 

@@ -6,7 +6,7 @@ use uuid::Uuid;
 use crate::{
     authorization::{
         AuthorizationContext, PermissionDenied,
-        permission_codes::{TERRITORIO_CREAR, TERRITORIO_VER},
+        permission_codes::{TERRITORIO_CREAR, TERRITORIO_GESTIONAR, TERRITORIO_VER},
     },
     external_references::ExternalId,
     idempotency::{IdempotencyKey, RequestFingerprint},
@@ -73,9 +73,53 @@ pub struct GeographicSourceView {
     pub parser_version: String,
     pub created_by: Uuid,
     pub created_at: OffsetDateTime,
+    pub replaces_source_id: Option<Uuid>,
+    pub correction_reason: Option<String>,
+    pub current_establishment_id: Option<Uuid>,
     pub confirmed_for_canonical_geometry: bool,
     pub confirmed_by: Option<Uuid>,
     pub confirmed_at: Option<OffsetDateTime>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CanonicalGeometryImpact {
+    pub establecimiento_id: Uuid,
+    pub source_ids: Vec<Uuid>,
+    pub geometry: Option<GeoJsonMultiPolygon>,
+    pub canonical_area_m2: Option<f64>,
+    pub excluded_base_plot_ids: Vec<Uuid>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GeographicSourceCorrectionPreview {
+    pub source_id: Uuid,
+    pub current_establishment_id: Uuid,
+    pub target_establishment_id: Uuid,
+    pub creates_revision: bool,
+    pub impacts: Vec<CanonicalGeometryImpact>,
+    pub conflicts: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GeographicSourceCorrectionCommand {
+    pub source_id: Uuid,
+    pub target_establishment_id: Uuid,
+    pub corrected_geometry: Option<NormalizedGeoJsonMultiPolygon>,
+    pub correction_reason: String,
+    pub replacement_fingerprint: Option<GeographicSourceFingerprint>,
+    pub idempotency_key: IdempotencyKey,
+    pub idempotency_request_fingerprint: RequestFingerprint,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GeographicSourceCorrectionResult {
+    pub previous_source_id: Uuid,
+    pub active_source_id: Uuid,
+    pub previous_establishment_id: Uuid,
+    pub target_establishment_id: Uuid,
+    pub created_revision: bool,
+    pub geometry_version_ids: Vec<Uuid>,
+    pub applied: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -167,6 +211,18 @@ pub enum TerritorySourceGroupingStoreError {
     Unavailable,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TerritoryCorrectionStoreError {
+    NotFound,
+    Conflict {
+        code: String,
+        message: String,
+        affected_base_plot_ids: Vec<Uuid>,
+    },
+    Validation(TerritoryPreviewStoreError),
+    Unavailable,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct GeoJsonMultiPolygon {
     pub coordinates: Vec<Vec<Vec<Vec<f64>>>>,
@@ -190,6 +246,7 @@ pub struct BasePlotView {
 #[derive(Clone, Debug, PartialEq)]
 pub struct EstablishmentView {
     pub id: Uuid,
+    pub geometry_version_id: Uuid,
     pub codigo: String,
     pub nombre: String,
     pub activo: bool,
@@ -213,6 +270,7 @@ pub struct OperationalUnitView {
     pub id: Uuid,
     pub campana_id: Uuid,
     pub establecimiento_id: Uuid,
+    pub establishment_geometry_version_id: Uuid,
     pub codigo: String,
     pub nombre: String,
     pub activa: bool,
@@ -348,13 +406,106 @@ pub trait TerritorySourceGroupingStore: Send + Sync {
     ) -> Result<CanonicalSourceGrouping, TerritorySourceGroupingStoreError>;
 }
 
+#[async_trait]
+pub trait TerritoryCorrectionStore: Send + Sync {
+    async fn preview_geographic_source_correction(
+        &self,
+        organization_id: Uuid,
+        source_id: Uuid,
+        target_establishment_id: Uuid,
+        corrected_geometry: Option<&NormalizedGeoJsonMultiPolygon>,
+    ) -> Result<GeographicSourceCorrectionPreview, TerritoryCorrectionStoreError>;
+
+    async fn confirm_geographic_source_correction(
+        &self,
+        organization_id: Uuid,
+        actor_id: Uuid,
+        command: GeographicSourceCorrectionCommand,
+    ) -> Result<GeographicSourceCorrectionResult, TerritoryCorrectionStoreError>;
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerritoryApplicationError {
     Validation(TerritoryValidationError),
     PermissionDenied,
     NotFound,
     Conflict,
+    ActionableConflict(TerritoryValidationError),
     Unavailable,
+}
+
+pub async fn preview_geographic_source_correction(
+    store: &dyn TerritoryCorrectionStore,
+    context: &AuthorizationContext,
+    source_id: Uuid,
+    target_establishment_id: Uuid,
+    corrected_geometry: Option<serde_json::Value>,
+) -> Result<GeographicSourceCorrectionPreview, TerritoryApplicationError> {
+    require_manage_permission(context)?;
+    let corrected_geometry = corrected_geometry
+        .map(geojson::normalize_geometry)
+        .transpose()
+        .map_err(geojson_validation_error)?;
+    store
+        .preview_geographic_source_correction(
+            context.organization_id,
+            source_id,
+            target_establishment_id,
+            corrected_geometry.as_ref(),
+        )
+        .await
+        .map_err(map_correction_store_error)
+}
+
+pub async fn confirm_geographic_source_correction(
+    store: &dyn TerritoryCorrectionStore,
+    context: &AuthorizationContext,
+    source_id: Uuid,
+    target_establishment_id: Uuid,
+    corrected_geometry: Option<serde_json::Value>,
+    correction_reason: String,
+    idempotency_key: IdempotencyKey,
+) -> Result<GeographicSourceCorrectionResult, TerritoryApplicationError> {
+    require_manage_permission(context)?;
+    if correction_reason.trim() != correction_reason
+        || correction_reason.is_empty()
+        || correction_reason.chars().count() > 1000
+    {
+        return Err(territorial_field_error(
+            "motivo_correccion_invalido",
+            "El motivo de corrección debe tener entre 1 y 1000 caracteres y no tener espacios laterales.",
+        ));
+    }
+    let corrected_geometry = corrected_geometry
+        .map(geojson::normalize_geometry)
+        .transpose()
+        .map_err(geojson_validation_error)?;
+    let replacement_fingerprint = corrected_geometry
+        .as_ref()
+        .map(|geometry| GeographicSourceFingerprint::for_correction(source_id, geometry));
+    let canonical_request = serde_json::to_vec(&json!({
+        "fuente_geografica_id": source_id,
+        "establecimiento_destino_id": target_establishment_id,
+        "geometria_corregida": corrected_geometry.as_ref().map(NormalizedGeoJsonMultiPolygon::as_geojson),
+        "motivo": correction_reason,
+    }))
+    .expect("canonical geographic correction request must serialize");
+    store
+        .confirm_geographic_source_correction(
+            context.organization_id,
+            context.user_id,
+            GeographicSourceCorrectionCommand {
+                source_id,
+                target_establishment_id,
+                corrected_geometry,
+                correction_reason,
+                replacement_fingerprint,
+                idempotency_key,
+                idempotency_request_fingerprint: RequestFingerprint::sha256(&canonical_request),
+            },
+        )
+        .await
+        .map_err(map_correction_store_error)
 }
 
 pub async fn preview_senasa_polygon(
@@ -400,6 +551,7 @@ pub async fn preview_geojson_geometry(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn create_alternative_establecimiento(
     store: &dyn TerritoryGeoJsonStore,
     context: &AuthorizationContext,
@@ -693,6 +845,47 @@ fn require_read_permission(
     context
         .require_permission(TERRITORIO_VER)
         .map_err(|PermissionDenied| TerritoryApplicationError::PermissionDenied)
+}
+
+fn require_manage_permission(
+    context: &AuthorizationContext,
+) -> Result<(), TerritoryApplicationError> {
+    context
+        .require_permission(TERRITORIO_GESTIONAR)
+        .map_err(|PermissionDenied| TerritoryApplicationError::PermissionDenied)
+}
+
+fn map_correction_store_error(error: TerritoryCorrectionStoreError) -> TerritoryApplicationError {
+    match error {
+        TerritoryCorrectionStoreError::NotFound => TerritoryApplicationError::NotFound,
+        TerritoryCorrectionStoreError::Conflict {
+            code,
+            message,
+            affected_base_plot_ids,
+        } => TerritoryApplicationError::ActionableConflict(TerritoryValidationError {
+            code: match code.as_str() {
+                "establecimiento_sin_geometria_confirmada" => {
+                    "establecimiento_sin_geometria_confirmada"
+                }
+                "lotes_base_fuera_geometria_canonica" => "lotes_base_fuera_geometria_canonica",
+                _ => "correccion_geografica_en_conflicto",
+            },
+            message,
+            detail: (!affected_base_plot_ids.is_empty()).then(|| {
+                format!(
+                    "Lotes base afectados: {}",
+                    affected_base_plot_ids
+                        .iter()
+                        .map(Uuid::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }),
+            line: None,
+        }),
+        TerritoryCorrectionStoreError::Validation(error) => map_preview_store_error(error),
+        TerritoryCorrectionStoreError::Unavailable => TerritoryApplicationError::Unavailable,
+    }
 }
 
 pub async fn create_establecimiento(

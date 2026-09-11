@@ -1286,6 +1286,7 @@ async fn confirmed_sources_define_exact_canonical_union_with_atomic_replacement_
         JOIN public.fuentes_geograficas AS fuente
           ON fuente.id = contribucion.fuente_geografica_id
         WHERE contribucion.establecimiento_id = $1
+          AND contribucion.vigente_hasta IS NULL
         "#,
     )
     .bind(establishment_id)
@@ -1438,13 +1439,13 @@ async fn confirmed_sources_define_exact_canonical_union_with_atomic_replacement_
     .bind(creator.user_id)
     .execute(&db)
     .await
-    .expect_err("database must reject a source from another establishment");
+    .expect_err("database must reject a direct membership that skips canonical versioning");
     assert_eq!(
         inconsistent_direct_link
             .as_database_error()
             .and_then(|error| error.code())
             .as_deref(),
-        Some("23503")
+        Some("P0001")
     );
 
     let (concurrent_a, concurrent_overlap) = tokio::join!(
@@ -1475,6 +1476,7 @@ async fn confirmed_sources_define_exact_canonical_union_with_atomic_replacement_
         JOIN public.fuentes_geograficas AS fuente
           ON fuente.id = contribucion.fuente_geografica_id
         WHERE contribucion.establecimiento_id = $1
+          AND contribucion.vigente_hasta IS NULL
         "#,
     )
     .bind(establishment_id)
@@ -1482,4 +1484,473 @@ async fn confirmed_sources_define_exact_canonical_union_with_atomic_replacement_
     .await
     .expect("final concurrent grouping state must be readable");
     assert_eq!(final_state, (1, true));
+}
+
+#[tokio::test]
+async fn geographic_correction_versions_evidence_membership_perimeters_and_uop_history_atomically()
+{
+    let _guard = database_test_lock().lock().await;
+    let db = test_pool().await;
+    let manager = principal(
+        &db,
+        &["territorio:crear", "territorio:gestionar", "territorio:ver"],
+    )
+    .await;
+    let denied = principal(&db, &["territorio:crear", "territorio:ver"]).await;
+    let origin = create_grouping_establishment(&db, manager, "CORRECCION_ORIGEN").await;
+    let target = create_grouping_establishment(&db, manager, "CORRECCION_DESTINO").await;
+    let keep = import_senasa_source(
+        &db,
+        manager,
+        origin,
+        "RENSPA-CORRECCION-KEEP",
+        SOURCE_A,
+        "correction-import-keep",
+    )
+    .await;
+    let moved = import_senasa_source(
+        &db,
+        manager,
+        origin,
+        "RENSPA-CORRECCION-MOVED",
+        SOURCE_B,
+        "correction-import-moved",
+    )
+    .await;
+    let target_source = import_senasa_source(
+        &db,
+        manager,
+        target,
+        "RENSPA-CORRECCION-TARGET",
+        SOURCE_OVERLAP,
+        "correction-import-target",
+    )
+    .await;
+    for (establishment_id, source_ids, key) in [
+        (origin, vec![keep, moved], "correction-group-origin"),
+        (target, vec![target_source], "correction-group-target"),
+    ] {
+        let grouped = post_json_with_idempotency(
+            state(db.clone()),
+            &format!(
+                "/territorio/establecimientos/{establishment_id}/fuentes-geograficas-confirmadas"
+            ),
+            Some(manager.subject),
+            serde_json::json!({ "fuente_geografica_ids": source_ids }),
+            key,
+        )
+        .await;
+        assert_eq!(grouped.status(), StatusCode::OK);
+    }
+
+    let base_plot_id: Uuid = sqlx::query_scalar(
+        r#"
+        INSERT INTO public.lotes_base (
+            organizacion_id, establecimiento_id, codigo, nombre, geometria, creado_por
+        ) VALUES (
+            $1, $2, 'HIST', 'Lote histórico',
+            ST_Multi(ST_GeomFromText(
+                'POLYGON((-59.999 -34.001, -59.999 -34.009, -59.991 -34.009, -59.991 -34.001, -59.999 -34.001))',
+                4326
+            )), $3
+        ) RETURNING id
+        "#,
+    )
+    .bind(manager.organization_id)
+    .bind(origin)
+    .bind(manager.user_id)
+    .fetch_one(&db)
+    .await
+    .expect("base plot inside retained source must insert");
+    let campaign_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO public.campanas (organizacion_id, codigo, nombre, fecha_inicio, fecha_fin, creado_por) VALUES ($1, 'CORR_2026', 'Campaña histórica', DATE '2026-07-01', DATE '2027-06-30', $2) RETURNING id",
+    )
+    .bind(manager.organization_id)
+    .bind(manager.user_id)
+    .fetch_one(&db)
+    .await
+    .expect("campaign must insert");
+    let mut uop_transaction = db.begin().await.expect("UOP transaction must begin");
+    let uop_id: Uuid = sqlx::query_scalar(
+        r#"
+        INSERT INTO public.unidades_operativas (
+            organizacion_id, campana_id, establecimiento_id, codigo, nombre, geometria, creado_por
+        ) VALUES (
+            $1, $2, $3, 'UOP_HIST', 'UOP histórica',
+            ST_Multi(ST_GeomFromText(
+                'POLYGON((-59.999 -34.001, -59.999 -34.009, -59.991 -34.009, -59.991 -34.001, -59.999 -34.001))',
+                4326
+            )), $4
+        ) RETURNING id
+        "#,
+    )
+    .bind(manager.organization_id)
+    .bind(campaign_id)
+    .bind(origin)
+    .bind(manager.user_id)
+    .fetch_one(&mut *uop_transaction)
+    .await
+    .expect("historical UOP must insert");
+    sqlx::query(
+        "INSERT INTO public.unidades_operativas_lotes_base (organizacion_id, establecimiento_id, unidad_operativa_id, lote_base_id, creado_por) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(manager.organization_id)
+    .bind(origin)
+    .bind(uop_id)
+    .bind(base_plot_id)
+    .bind(manager.user_id)
+    .execute(&mut *uop_transaction)
+    .await
+    .expect("historical UOP link must insert");
+    uop_transaction.commit().await.expect("UOP must commit");
+    let uop_before: (Uuid, Vec<u8>, Vec<u8>) = sqlx::query_as(
+        r#"
+        SELECT unidad.establecimiento_geometria_version_id,
+               ST_AsEWKB(unidad.geometria), ST_AsEWKB(version.geometria)
+        FROM public.unidades_operativas AS unidad
+        JOIN public.establecimientos_geometrias_versiones AS version
+          ON version.id = unidad.establecimiento_geometria_version_id
+        WHERE unidad.id = $1
+        "#,
+    )
+    .bind(uop_id)
+    .fetch_one(&db)
+    .await
+    .expect("historical UOP perimeter reference must be readable");
+    let moved_before: (Vec<u8>, String, Vec<u8>, Uuid, Option<String>) = sqlx::query_as(
+        "SELECT ST_AsEWKB(geometria), texto_fuente_original, huella_sha256, creado_por, motivo_correccion FROM public.fuentes_geograficas WHERE id = $1",
+    )
+    .bind(moved)
+    .fetch_one(&db)
+    .await
+    .expect("original evidence must be readable");
+
+    let corrected_geometry = serde_json::json!({
+        "type": "MultiPolygon",
+        "coordinates": [
+            [[[-59.96, -34.0], [-59.96, -34.01], [-59.95, -34.01], [-59.95, -34.0], [-59.96, -34.0]]],
+            [[[-59.93, -34.0], [-59.93, -34.01], [-59.92, -34.01], [-59.92, -34.0], [-59.93, -34.0]]]
+        ]
+    });
+    let correction_body = serde_json::json!({
+        "establecimiento_destino_id": target,
+        "geometry": corrected_geometry,
+        "motivo": "Corrección de coordenadas y reasignación confirmada por negocio"
+    });
+    let correction_path = format!("/territorio/fuentes-geograficas/{moved}/correcciones");
+    let preview = post_json(
+        state(db.clone()),
+        &format!("{correction_path}/previsualizacion"),
+        Some(manager.subject),
+        correction_body.clone(),
+    )
+    .await;
+    assert_eq!(preview.status(), StatusCode::OK);
+    let preview = json_body(preview).await;
+    assert_eq!(preview["crea_revision"], true);
+    assert_eq!(preview["conflictos"], serde_json::json!([]));
+    assert_eq!(preview["impactos"].as_array().unwrap().len(), 2);
+
+    let forbidden = post_json_with_idempotency(
+        state(db.clone()),
+        &correction_path,
+        Some(denied.subject),
+        correction_body.clone(),
+        "correction-forbidden",
+    )
+    .await;
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    let corrected = post_json_with_idempotency(
+        state(db.clone()),
+        &correction_path,
+        Some(manager.subject),
+        correction_body.clone(),
+        "correction-confirm",
+    )
+    .await;
+    assert_eq!(corrected.status(), StatusCode::OK);
+    let corrected = json_body(corrected).await;
+    let replacement = Uuid::parse_str(corrected["fuente_activa_id"].as_str().unwrap()).unwrap();
+    assert_ne!(replacement, moved);
+    assert_eq!(corrected["revision_creada"], true);
+    assert_eq!(corrected["aplicada"], true);
+    assert_eq!(
+        corrected["version_geometria_ids"].as_array().unwrap().len(),
+        2
+    );
+
+    let moved_after: (Vec<u8>, String, Vec<u8>, Uuid, Option<String>) = sqlx::query_as(
+        "SELECT ST_AsEWKB(geometria), texto_fuente_original, huella_sha256, creado_por, motivo_correccion FROM public.fuentes_geograficas WHERE id = $1",
+    )
+    .bind(moved)
+    .fetch_one(&db)
+    .await
+    .expect("original evidence must remain readable");
+    assert_eq!(moved_after, moved_before);
+    let lineage: (Uuid, String, String, Option<String>, bool) = sqlx::query_as(
+        r#"
+        SELECT nueva.reemplaza_fuente_geografica_id, nueva.motivo_correccion, nueva.version_parser,
+               referencia.external_id, ST_Equals(nueva.geometria, anterior.geometria)
+        FROM public.fuentes_geograficas AS nueva
+        JOIN public.fuentes_geograficas AS anterior
+          ON anterior.id = nueva.reemplaza_fuente_geografica_id
+        LEFT JOIN public.external_references AS referencia
+          ON referencia.id = nueva.external_reference_id
+        WHERE nueva.id = $1
+        "#,
+    )
+    .bind(replacement)
+    .fetch_one(&db)
+    .await
+    .expect("correction lineage must be queryable");
+    assert_eq!(lineage.0, moved);
+    assert_eq!(
+        lineage.1,
+        "Corrección de coordenadas y reasignación confirmada por negocio"
+    );
+    assert_eq!(lineage.2, "territory_correction_geojson_v1");
+    assert_eq!(lineage.3.as_deref(), Some("RENSPA-CORRECCION-MOVED"));
+    assert!(!lineage.4);
+
+    let memberships: Vec<(Uuid, Uuid, Option<time::OffsetDateTime>, Option<Uuid>)> =
+        sqlx::query_as(
+            r#"
+            SELECT fuente_geografica_id, establecimiento_id, vigente_hasta,
+                   reemplazada_por_contribucion_id
+            FROM public.fuentes_geograficas_contribuciones_canonicas
+            WHERE fuente_geografica_id = ANY($1::uuid[])
+            ORDER BY confirmado_en, id
+            "#,
+        )
+        .bind([moved, replacement])
+        .fetch_all(&db)
+        .await
+        .expect("membership history must be queryable");
+    assert_eq!(memberships.len(), 2);
+    assert_eq!(memberships[0].0, moved);
+    assert_eq!(memberships[0].1, origin);
+    assert!(memberships[0].2.is_some());
+    assert!(memberships[0].3.is_some());
+    assert_eq!(memberships[1].0, replacement);
+    assert_eq!(memberships[1].1, target);
+    assert!(memberships[1].2.is_none());
+
+    let canonical: (bool, bool, String, i32, bool) = sqlx::query_as(
+        r#"
+        SELECT
+            ST_Equals(origen.geometria, fuente_conservada.geometria),
+            ST_Equals(
+                destino.geometria,
+                (SELECT ST_Multi(ST_UnaryUnion(ST_Collect(fuente.geometria)))
+                 FROM public.fuentes_geograficas_contribuciones_canonicas AS contribucion
+                 JOIN public.fuentes_geograficas AS fuente
+                   ON fuente.id = contribucion.fuente_geografica_id
+                 WHERE contribucion.establecimiento_id = $2
+                   AND contribucion.vigente_hasta IS NULL)
+            ),
+            GeometryType(destino.geometria),
+            ST_NumGeometries(destino.geometria),
+            NOT ST_Covers(destino.geometria, ST_SetSRID(ST_Point(-59.94, -34.005), 4326))
+        FROM public.establecimientos AS origen
+        JOIN public.establecimientos AS destino ON destino.id = $2
+        JOIN public.fuentes_geograficas AS fuente_conservada ON fuente_conservada.id = $3
+        WHERE origen.id = $1
+        "#,
+    )
+    .bind(origin)
+    .bind(target)
+    .bind(keep)
+    .fetch_one(&db)
+    .await
+    .expect("both affected canonical geometries must be exact");
+    assert!(canonical.0);
+    assert!(canonical.1);
+    assert_eq!(canonical.2, "MULTIPOLYGON");
+    assert!(canonical.3 >= 2);
+    assert!(
+        canonical.4,
+        "exact union must not fill the gap between components"
+    );
+
+    let uop_after: (Uuid, Vec<u8>, Vec<u8>) = sqlx::query_as(
+        r#"
+        SELECT unidad.establecimiento_geometria_version_id,
+               ST_AsEWKB(unidad.geometria), ST_AsEWKB(version.geometria)
+        FROM public.unidades_operativas AS unidad
+        JOIN public.establecimientos_geometrias_versiones AS version
+          ON version.id = unidad.establecimiento_geometria_version_id
+        WHERE unidad.id = $1
+        "#,
+    )
+    .bind(uop_id)
+    .fetch_one(&db)
+    .await
+    .expect("historical UOP version must remain readable");
+    assert_eq!(uop_after, uop_before);
+
+    let counts_before_replay: (i64, i64, i64, i64) = sqlx::query_as(
+        r#"
+        SELECT
+            (SELECT COUNT(*) FROM public.fuentes_geograficas WHERE reemplaza_fuente_geografica_id = $1),
+            (SELECT COUNT(*) FROM public.fuentes_geograficas_contribuciones_canonicas WHERE fuente_geografica_id = ANY($2::uuid[])),
+            (SELECT COUNT(*) FROM public.establecimientos_geometrias_versiones WHERE id = ANY($3::uuid[])),
+            (SELECT COUNT(*) FROM public.audit_events WHERE accion = 'fuente_geografica.corregida_reasignada' AND entidad_id = $4)
+        "#,
+    )
+    .bind(moved)
+    .bind([moved, replacement])
+    .bind(
+        corrected["version_geometria_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| Uuid::parse_str(id.as_str().unwrap()).unwrap())
+            .collect::<Vec<_>>(),
+    )
+    .bind(replacement)
+    .fetch_one(&db)
+    .await
+    .expect("correction effects must be countable");
+    assert_eq!(counts_before_replay, (1, 2, 2, 1));
+    let replay = post_json_with_idempotency(
+        state(db.clone()),
+        &correction_path,
+        Some(manager.subject),
+        correction_body,
+        "correction-confirm",
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(json_body(replay).await["aplicada"], false);
+    let counts_after_replay: (i64, i64, i64, i64) = sqlx::query_as(
+        r#"
+        SELECT
+            (SELECT COUNT(*) FROM public.fuentes_geograficas WHERE reemplaza_fuente_geografica_id = $1),
+            (SELECT COUNT(*) FROM public.fuentes_geograficas_contribuciones_canonicas WHERE fuente_geografica_id = ANY($2::uuid[])),
+            (SELECT COUNT(*) FROM public.establecimientos_geometrias_versiones WHERE id = ANY($3::uuid[])),
+            (SELECT COUNT(*) FROM public.audit_events WHERE accion = 'fuente_geografica.corregida_reasignada' AND entidad_id = $4)
+        "#,
+    )
+    .bind(moved)
+    .bind([moved, replacement])
+    .bind(
+        corrected["version_geometria_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| Uuid::parse_str(id.as_str().unwrap()).unwrap())
+            .collect::<Vec<_>>(),
+    )
+    .bind(replacement)
+    .fetch_one(&db)
+    .await
+    .expect("replayed effects must be countable");
+    assert_eq!(counts_after_replay, counts_before_replay);
+    let audit_actor: Uuid = sqlx::query_scalar(
+        "SELECT actor_usuario_id FROM public.audit_events WHERE accion = 'fuente_geografica.corregida_reasignada' AND entidad_id = $1",
+    )
+    .bind(replacement)
+    .fetch_one(&db)
+    .await
+    .expect("correction audit must identify actor");
+    assert_eq!(audit_actor, manager.user_id);
+
+    let origin_state_before_conflicts: (Vec<u8>, i64, i64) = sqlx::query_as(
+        r#"
+        SELECT ST_AsEWKB(geometria),
+               (SELECT COUNT(*) FROM public.fuentes_geograficas),
+               (SELECT COUNT(*) FROM public.fuentes_geograficas_contribuciones_canonicas)
+        FROM public.establecimientos WHERE id = $1
+        "#,
+    )
+    .bind(origin)
+    .fetch_one(&db)
+    .await
+    .expect("origin state must be readable");
+    let move_last = post_json_with_idempotency(
+        state(db.clone()),
+        &format!("/territorio/fuentes-geograficas/{keep}/correcciones"),
+        Some(manager.subject),
+        serde_json::json!({
+            "establecimiento_destino_id": target,
+            "motivo": "Intento de mover la última contribución"
+        }),
+        "correction-last-source",
+    )
+    .await;
+    assert_eq!(move_last.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(move_last).await["codigo"],
+        "establecimiento_sin_geometria_confirmada"
+    );
+    let excludes_lote = post_json_with_idempotency(
+        state(db.clone()),
+        &format!("/territorio/fuentes-geograficas/{keep}/correcciones"),
+        Some(manager.subject),
+        serde_json::json!({
+            "establecimiento_destino_id": origin,
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[[-59.5, -34.0], [-59.5, -34.01], [-59.49, -34.01], [-59.49, -34.0], [-59.5, -34.0]]]
+            },
+            "motivo": "Intento que excluiría el lote actual"
+        }),
+        "correction-excludes-base-plot",
+    )
+    .await;
+    assert_eq!(excludes_lote.status(), StatusCode::CONFLICT);
+    let excludes_lote = json_body(excludes_lote).await;
+    assert_eq!(
+        excludes_lote["codigo"],
+        "lotes_base_fuera_geometria_canonica"
+    );
+    assert!(
+        excludes_lote["detalle"]
+            .as_str()
+            .unwrap()
+            .contains(&base_plot_id.to_string())
+    );
+    let origin_state_after_conflicts: (Vec<u8>, i64, i64) = sqlx::query_as(
+        r#"
+        SELECT ST_AsEWKB(geometria),
+               (SELECT COUNT(*) FROM public.fuentes_geograficas),
+               (SELECT COUNT(*) FROM public.fuentes_geograficas_contribuciones_canonicas)
+        FROM public.establecimientos WHERE id = $1
+        "#,
+    )
+    .bind(origin)
+    .fetch_one(&db)
+    .await
+    .expect("origin state after rejected corrections must be readable");
+    assert_eq!(origin_state_after_conflicts, origin_state_before_conflicts);
+
+    let direct_source_overwrite = sqlx::query(
+        "UPDATE public.fuentes_geograficas SET geometria = ST_Multi(ST_GeomFromText('POLYGON((-59 -34, -59 -34.01, -58.99 -34.01, -58.99 -34, -59 -34))', 4326)) WHERE id = $1",
+    )
+    .bind(moved)
+    .execute(&db)
+    .await
+    .expect_err("immutable source evidence must reject direct overwrite");
+    assert_eq!(
+        direct_source_overwrite
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("P0001")
+    );
+    let direct_history_delete = sqlx::query(
+        "DELETE FROM public.fuentes_geograficas_contribuciones_canonicas WHERE fuente_geografica_id = $1",
+    )
+    .bind(moved)
+    .execute(&db)
+    .await
+    .expect_err("historical membership must reject direct deletion");
+    assert_eq!(
+        direct_history_delete
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("P0001")
+    );
 }

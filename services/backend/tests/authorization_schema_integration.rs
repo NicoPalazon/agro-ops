@@ -212,6 +212,7 @@ async fn materializes_relations_catalog_and_approved_primary_key_names() {
         "consola_tecnica:ver",
         "consola_tecnica:administrar",
         "territorio:crear",
+        "territorio:gestionar",
         "territorio:ver",
     ]
     .into_iter()
@@ -224,7 +225,7 @@ async fn materializes_relations_catalog_and_approved_primary_key_names() {
             .fetch_one(&db)
             .await
             .expect("permission uniqueness must be queryable");
-    assert_eq!(distinct_codes, 18);
+    assert_eq!(distinct_codes, 19);
 
     let primary_keys: Vec<String> = sqlx::query_scalar(
         "SELECT constraint_name FROM information_schema.table_constraints WHERE table_schema = 'public' AND constraint_type = 'PRIMARY KEY' AND table_name IN ('organizaciones', 'usuarios', 'identidades_autenticacion_externas', 'roles', 'permisos', 'usuarios_roles', 'roles_permisos') ORDER BY constraint_name",

@@ -10,6 +10,7 @@ pub mod permission_codes {
     pub const CONFIGURACION_ADMINISTRAR: &str = "configuracion:administrar";
     pub const CONSOLA_TECNICA_VER: &str = "consola_tecnica:ver";
     pub const TERRITORIO_CREAR: &str = "territorio:crear";
+    pub const TERRITORIO_GESTIONAR: &str = "territorio:gestionar";
     pub const TERRITORIO_VER: &str = "territorio:ver";
 }
 

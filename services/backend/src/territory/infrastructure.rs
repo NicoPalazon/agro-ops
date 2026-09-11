@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sqlx::{Executor, PgPool, Postgres, Transaction, types::Json};
+use sqlx::{Executor, PgConnection, PgPool, Postgres, Transaction, types::Json};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -17,22 +17,25 @@ use crate::{
     },
     territory::{
         application::{
-            BasePlotView, CampaignView, CanonicalSourceGrouping, ConfirmedGeographicSource,
-            CreatedAlternativeEstablecimiento, CreatedGeoJsonLoteBase, EstablishmentView,
-            ExternalReferenceView, GeoJsonMultiPolygon, GeographicSourceView,
-            NewAlternativeEstablecimiento, NewCanonicalSourceGrouping, NewGeoJsonLoteBase,
-            NewSenasaGeographicSource, OperationalUnitView, TerritorialUseAssignmentView,
-            TerritoryGeoJsonStore, TerritoryPreviewStore, TerritoryPreviewStoreError,
-            TerritoryReadStore, TerritoryReadStoreError, TerritorySourceGroupingStore,
-            TerritorySourceGroupingStoreError, TerritorySourceStore, TerritorySourceStoreError,
-            TerritoryStore, TerritoryStoreError,
+            BasePlotView, CampaignView, CanonicalGeometryImpact, CanonicalSourceGrouping,
+            ConfirmedGeographicSource, CreatedAlternativeEstablecimiento, CreatedGeoJsonLoteBase,
+            EstablishmentView, ExternalReferenceView, GeoJsonMultiPolygon,
+            GeographicSourceCorrectionCommand, GeographicSourceCorrectionPreview,
+            GeographicSourceCorrectionResult, GeographicSourceView, NewAlternativeEstablecimiento,
+            NewCanonicalSourceGrouping, NewGeoJsonLoteBase, NewSenasaGeographicSource,
+            OperationalUnitView, TerritorialUseAssignmentView, TerritoryCorrectionStore,
+            TerritoryCorrectionStoreError, TerritoryGeoJsonStore, TerritoryPreviewStore,
+            TerritoryPreviewStoreError, TerritoryReadStore, TerritoryReadStoreError,
+            TerritorySourceGroupingStore, TerritorySourceGroupingStoreError, TerritorySourceStore,
+            TerritorySourceStoreError, TerritoryStore, TerritoryStoreError,
         },
         domain::{
             CanonicalTerritorialCode, Establecimiento, FunctionalName, GeometryProvenance,
             LoteBase, NewEstablecimiento, NewLoteBase, TERRITORIAL_SRID,
         },
         geographic_source::{
-            GeographicSourceFingerprint, GeographicSourceType, SENASA_PARSER_VERSION,
+            CORRECTION_PARSER_VERSION, GeographicSourceFingerprint, GeographicSourceType,
+            SENASA_PARSER_VERSION,
         },
         geojson::{GEOJSON_INPUT_VERSION, NormalizedGeoJsonMultiPolygon},
     },
@@ -40,6 +43,25 @@ use crate::{
 
 const RENSPA_SYSTEM: &str = "senasa";
 const ESTABLECIMIENTO_ENTITY_TYPE: &str = "establecimiento";
+
+#[derive(sqlx::FromRow)]
+struct CorrectionImpactRow {
+    geometry: Option<Json<Value>>,
+    canonical_area_m2: Option<f64>,
+    source_ids: Vec<Uuid>,
+    excluded_base_plot_ids: Vec<Uuid>,
+    valid: Option<bool>,
+}
+
+#[derive(sqlx::FromRow)]
+struct CorrectionSourceRow {
+    old_contribution_id: Uuid,
+    previous_establishment_id: Uuid,
+    external_reference_id: Option<Uuid>,
+    source_type: String,
+    external_name: Option<String>,
+    capture_establishment_id: Uuid,
+}
 
 #[derive(Clone)]
 pub struct PostgresTerritoryStore {
@@ -241,14 +263,25 @@ impl TerritorySourceStore for PostgresTerritoryStore {
             r#"
             SELECT fuente.id, fuente.establecimiento_id, fuente.external_reference_id,
                    referencia.external_id, fuente.tipo_origen, fuente.nombre_externo,
-                   fuente.texto_fuente_original, ST_AsGeoJSON(fuente.geometria, 9, 0)::jsonb,
+                   fuente.texto_fuente_original, ST_AsGeoJSON(fuente.geometria, 9, 0)::jsonb AS geometria_geojson,
                    fuente.huella_sha256, fuente.version_parser, fuente.creado_por, fuente.creado_en,
+                   fuente.reemplaza_fuente_geografica_id, fuente.motivo_correccion,
+                   contribucion.establecimiento_id AS establecimiento_actual_id,
                    contribucion.confirmado_por, contribucion.confirmado_en
             FROM public.fuentes_geograficas AS fuente
             LEFT JOIN public.external_references AS referencia ON referencia.id = fuente.external_reference_id
             LEFT JOIN public.fuentes_geograficas_contribuciones_canonicas AS contribucion
               ON contribucion.fuente_geografica_id = fuente.id
-            WHERE fuente.organizacion_id = $1 AND fuente.establecimiento_id = $2
+             AND contribucion.vigente_hasta IS NULL
+            WHERE fuente.organizacion_id = $1
+              AND (
+                  fuente.establecimiento_id = $2
+                  OR EXISTS (
+                      SELECT 1 FROM public.fuentes_geograficas_contribuciones_canonicas AS historia
+                      WHERE historia.fuente_geografica_id = fuente.id
+                        AND historia.establecimiento_id = $2
+                  )
+              )
             ORDER BY fuente.creado_en, fuente.id
             "#,
         )
@@ -292,6 +325,492 @@ impl TerritorySourceGroupingStore for PostgresTerritoryStore {
                 Err(error)
             }
         }
+    }
+}
+
+#[async_trait]
+impl TerritoryCorrectionStore for PostgresTerritoryStore {
+    async fn preview_geographic_source_correction(
+        &self,
+        organization_id: Uuid,
+        source_id: Uuid,
+        target_establishment_id: Uuid,
+        corrected_geometry: Option<&NormalizedGeoJsonMultiPolygon>,
+    ) -> Result<GeographicSourceCorrectionPreview, TerritoryCorrectionStoreError> {
+        let mut connection = self
+            .db
+            .acquire()
+            .await
+            .map_err(|_| TerritoryCorrectionStoreError::Unavailable)?;
+        correction_preview_on_connection(
+            &mut connection,
+            organization_id,
+            source_id,
+            target_establishment_id,
+            corrected_geometry,
+        )
+        .await
+    }
+
+    async fn confirm_geographic_source_correction(
+        &self,
+        organization_id: Uuid,
+        actor_id: Uuid,
+        command: GeographicSourceCorrectionCommand,
+    ) -> Result<GeographicSourceCorrectionResult, TerritoryCorrectionStoreError> {
+        let mut transaction = self
+            .db
+            .begin()
+            .await
+            .map_err(|_| TerritoryCorrectionStoreError::Unavailable)?;
+        let result =
+            confirm_correction_in_transaction(&mut transaction, organization_id, actor_id, command)
+                .await;
+        match result {
+            Ok(result) => transaction
+                .commit()
+                .await
+                .map(|()| result)
+                .map_err(|_| TerritoryCorrectionStoreError::Unavailable),
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+}
+
+async fn correction_preview_on_connection(
+    connection: &mut PgConnection,
+    organization_id: Uuid,
+    source_id: Uuid,
+    target_establishment_id: Uuid,
+    corrected_geometry: Option<&NormalizedGeoJsonMultiPolygon>,
+) -> Result<GeographicSourceCorrectionPreview, TerritoryCorrectionStoreError> {
+    if let Some(geometry) = corrected_geometry {
+        validate_normalized_geometry(&mut *connection, geometry)
+            .await
+            .map_err(TerritoryCorrectionStoreError::Validation)?;
+    }
+    let source: Option<(Uuid, Json<Value>)> = sqlx::query_as(
+        r#"
+        SELECT contribucion.establecimiento_id,
+               ST_AsGeoJSON(fuente.geometria, 9, 0)::jsonb
+        FROM public.fuentes_geograficas AS fuente
+        JOIN public.fuentes_geograficas_contribuciones_canonicas AS contribucion
+          ON contribucion.fuente_geografica_id = fuente.id
+         AND contribucion.vigente_hasta IS NULL
+        WHERE fuente.organizacion_id = $1 AND fuente.id = $2
+        "#,
+    )
+    .bind(organization_id)
+    .bind(source_id)
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(|_| TerritoryCorrectionStoreError::Unavailable)?;
+    let Some((current_establishment_id, Json(source_geometry))) = source else {
+        return Err(TerritoryCorrectionStoreError::NotFound);
+    };
+    let target_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM public.establecimientos WHERE organizacion_id = $1 AND id = $2)",
+    )
+    .bind(organization_id)
+    .bind(target_establishment_id)
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(|_| TerritoryCorrectionStoreError::Unavailable)?;
+    if !target_exists {
+        return Err(TerritoryCorrectionStoreError::NotFound);
+    }
+    let effective_geometry = corrected_geometry
+        .map(NormalizedGeoJsonMultiPolygon::as_geojson)
+        .unwrap_or(source_geometry);
+    let mut affected_establishments = vec![current_establishment_id];
+    if target_establishment_id != current_establishment_id {
+        affected_establishments.push(target_establishment_id);
+    }
+    affected_establishments.sort_unstable();
+
+    let mut impacts = Vec::with_capacity(affected_establishments.len());
+    let mut conflicts = Vec::new();
+    if corrected_geometry.is_none() && target_establishment_id == current_establishment_id {
+        conflicts.push("correccion_sin_cambios".to_owned());
+    }
+    for establishment_id in affected_establishments {
+        let row: CorrectionImpactRow = sqlx::query_as(
+                r#"
+                WITH candidatas AS MATERIALIZED (
+                    SELECT fuente.id, fuente.geometria
+                    FROM public.fuentes_geograficas_contribuciones_canonicas AS contribucion
+                    JOIN public.fuentes_geograficas AS fuente
+                      ON fuente.id = contribucion.fuente_geografica_id
+                     AND fuente.organizacion_id = contribucion.organizacion_id
+                    WHERE contribucion.organizacion_id = $1
+                      AND contribucion.establecimiento_id = $2
+                      AND contribucion.vigente_hasta IS NULL
+                      AND fuente.id <> $3
+                    UNION ALL
+                    SELECT $3, ST_Multi(ST_SetSRID(ST_GeomFromGeoJSON($5::jsonb), 4326))
+                    WHERE $2 = $4
+                ), canonica AS (
+                    SELECT ST_Multi(ST_UnaryUnion(ST_Collect(geometria))) AS geometria,
+                           array_agg(id ORDER BY id) AS ids
+                    FROM candidatas
+                )
+                SELECT ST_AsGeoJSON(canonica.geometria, 9, 0)::jsonb AS geometry,
+                       ST_Area(canonica.geometria::geography)::float8 AS canonical_area_m2,
+                       COALESCE(canonica.ids, ARRAY[]::uuid[]) AS source_ids,
+                       COALESCE((
+                           SELECT array_agg(lote.id ORDER BY lote.id)
+                           FROM public.lotes_base AS lote
+                           WHERE lote.organizacion_id = $1
+                             AND lote.establecimiento_id = $2
+                             AND lote.activo
+                             AND (canonica.geometria IS NULL OR NOT ST_CoveredBy(lote.geometria, canonica.geometria))
+                       ), ARRAY[]::uuid[]) AS excluded_base_plot_ids,
+                       CASE WHEN canonica.geometria IS NULL THEN NULL
+                            ELSE ST_IsValid(canonica.geometria) AND NOT ST_IsEmpty(canonica.geometria)
+                                 AND GeometryType(canonica.geometria) = 'MULTIPOLYGON'
+                                 AND ST_SRID(canonica.geometria) = 4326 END AS valid
+                FROM canonica
+                "#,
+            )
+            .bind(organization_id)
+            .bind(establishment_id)
+            .bind(source_id)
+            .bind(target_establishment_id)
+            .bind(Json(effective_geometry.clone()))
+            .fetch_one(&mut *connection)
+            .await
+            .map_err(|_| TerritoryCorrectionStoreError::Unavailable)?;
+        if row.geometry.is_none() || row.valid != Some(true) {
+            conflicts.push("establecimiento_sin_geometria_confirmada".to_owned());
+        }
+        if !row.excluded_base_plot_ids.is_empty() {
+            conflicts.push("lotes_base_fuera_geometria_canonica".to_owned());
+        }
+        impacts.push(CanonicalGeometryImpact {
+            establecimiento_id: establishment_id,
+            source_ids: row.source_ids,
+            geometry: row
+                .geometry
+                .map(|Json(value)| multipolygon_from_geojson(value))
+                .transpose()
+                .map_err(|_| TerritoryCorrectionStoreError::Unavailable)?,
+            canonical_area_m2: row.canonical_area_m2,
+            excluded_base_plot_ids: row.excluded_base_plot_ids,
+        });
+    }
+    conflicts.sort();
+    conflicts.dedup();
+    Ok(GeographicSourceCorrectionPreview {
+        source_id,
+        current_establishment_id,
+        target_establishment_id,
+        creates_revision: corrected_geometry.is_some(),
+        impacts,
+        conflicts,
+    })
+}
+
+async fn confirm_correction_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    organization_id: Uuid,
+    actor_id: Uuid,
+    command: GeographicSourceCorrectionCommand,
+) -> Result<GeographicSourceCorrectionResult, TerritoryCorrectionStoreError> {
+    let operation = OperationCode::new("territorio.corregir_fuente_geografica")
+        .expect("territorial correction operation code must be canonical");
+    let decision = idempotency::begin(
+        transaction,
+        IdempotencyRequest {
+            organization_id: Some(organization_id),
+            operation,
+            key: command.idempotency_key,
+            request_fingerprint: command.idempotency_request_fingerprint,
+        },
+    )
+    .await
+    .map_err(map_correction_idempotency_error)?;
+    if let IdempotencyDecision::Replay(replay) = decision {
+        let value = replay.result.as_value();
+        return Ok(GeographicSourceCorrectionResult {
+            previous_source_id: parse_replay_uuid(value, "fuente_anterior_id")?,
+            active_source_id: parse_replay_uuid(value, "fuente_activa_id")?,
+            previous_establishment_id: parse_replay_uuid(value, "establecimiento_anterior_id")?,
+            target_establishment_id: parse_replay_uuid(value, "establecimiento_destino_id")?,
+            created_revision: value
+                .get("revision_creada")
+                .and_then(Value::as_bool)
+                .ok_or(TerritoryCorrectionStoreError::Unavailable)?,
+            geometry_version_ids: value
+                .get("version_geometria_ids")
+                .cloned()
+                .and_then(|ids| serde_json::from_value(ids).ok())
+                .ok_or(TerritoryCorrectionStoreError::Unavailable)?,
+            applied: false,
+        });
+    }
+    let IdempotencyDecision::Proceed(pending) = decision else {
+        unreachable!()
+    };
+
+    let source: Option<CorrectionSourceRow> = sqlx::query_as(
+        r#"
+        SELECT contribucion.id AS old_contribution_id,
+               contribucion.establecimiento_id AS previous_establishment_id,
+               fuente.external_reference_id,
+               fuente.tipo_origen AS source_type,
+               fuente.nombre_externo AS external_name,
+               fuente.establecimiento_id AS capture_establishment_id
+        FROM public.fuentes_geograficas AS fuente
+        JOIN public.fuentes_geograficas_contribuciones_canonicas AS contribucion
+          ON contribucion.fuente_geografica_id = fuente.id
+         AND contribucion.vigente_hasta IS NULL
+        WHERE fuente.organizacion_id = $1 AND fuente.id = $2
+        FOR UPDATE OF fuente, contribucion
+        "#,
+    )
+    .bind(organization_id)
+    .bind(command.source_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(|_| TerritoryCorrectionStoreError::Unavailable)?;
+    let Some(CorrectionSourceRow {
+        old_contribution_id,
+        previous_establishment_id,
+        external_reference_id,
+        source_type,
+        external_name,
+        capture_establishment_id,
+    }) = source
+    else {
+        return Err(TerritoryCorrectionStoreError::NotFound);
+    };
+    let mut affected = vec![previous_establishment_id];
+    if command.target_establishment_id != previous_establishment_id {
+        affected.push(command.target_establishment_id);
+    }
+    affected.sort_unstable();
+    let locked: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM public.establecimientos WHERE organizacion_id = $1 AND id = ANY($2::uuid[]) ORDER BY id FOR UPDATE",
+    )
+    .bind(organization_id)
+    .bind(&affected)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|_| TerritoryCorrectionStoreError::Unavailable)?;
+    if locked != affected {
+        return Err(TerritoryCorrectionStoreError::NotFound);
+    }
+    if let Some(geometry) = command.corrected_geometry.as_ref() {
+        validate_normalized_geometry(&mut **transaction, geometry)
+            .await
+            .map_err(TerritoryCorrectionStoreError::Validation)?;
+    }
+    let preview = correction_preview_on_connection(
+        transaction,
+        organization_id,
+        command.source_id,
+        command.target_establishment_id,
+        command.corrected_geometry.as_ref(),
+    )
+    .await?;
+    if let Some(code) = preview.conflicts.first() {
+        let affected_base_plot_ids = preview
+            .impacts
+            .iter()
+            .flat_map(|impact| impact.excluded_base_plot_ids.iter().copied())
+            .collect();
+        let message = match code.as_str() {
+            "establecimiento_sin_geometria_confirmada" => {
+                "La corrección dejaría un establecimiento confirmado sin geometría canónica válida."
+            }
+            "lotes_base_fuera_geometria_canonica" => {
+                "La corrección dejaría lotes base actuales fuera de la geometría canónica."
+            }
+            _ => "La corrección no produce ningún cambio territorial.",
+        };
+        return Err(TerritoryCorrectionStoreError::Conflict {
+            code: code.clone(),
+            message: message.to_owned(),
+            affected_base_plot_ids,
+        });
+    }
+
+    let active_source_id = if let Some(geometry) = command.corrected_geometry.as_ref() {
+        let replacement_id = Uuid::new_v4();
+        let original_text = serde_json::to_string(&geometry.as_geojson())
+            .map_err(|_| TerritoryCorrectionStoreError::Unavailable)?;
+        sqlx::query(
+            r#"
+            INSERT INTO public.fuentes_geograficas (
+                id, organizacion_id, establecimiento_id, external_reference_id, tipo_origen,
+                nombre_externo, texto_fuente_original, geometria, huella_sha256,
+                version_parser, creado_por, reemplaza_fuente_geografica_id, motivo_correccion
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7,
+                ST_Multi(ST_SetSRID(ST_GeomFromGeoJSON($8::jsonb), 4326)),
+                $9, $10, $11, $12, $13
+            )
+            "#,
+        )
+        .bind(replacement_id)
+        .bind(organization_id)
+        .bind(capture_establishment_id)
+        .bind(external_reference_id)
+        .bind(source_type)
+        .bind(external_name)
+        .bind(original_text)
+        .bind(Json(geometry.as_geojson()))
+        .bind(
+            command
+                .replacement_fingerprint
+                .expect("correction geometry has fingerprint")
+                .as_bytes()
+                .as_slice(),
+        )
+        .bind(CORRECTION_PARSER_VERSION)
+        .bind(actor_id)
+        .bind(command.source_id)
+        .bind(&command.correction_reason)
+        .execute(&mut **transaction)
+        .await
+        .map_err(map_correction_database_error)?;
+        replacement_id
+    } else {
+        command.source_id
+    };
+    let new_contribution_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        UPDATE public.fuentes_geograficas_contribuciones_canonicas
+        SET vigente_hasta = statement_timestamp(), cerrada_por = $1,
+            reemplazada_por_contribucion_id = $2
+        WHERE id = $3 AND organizacion_id = $4 AND vigente_hasta IS NULL
+        "#,
+    )
+    .bind(actor_id)
+    .bind(new_contribution_id)
+    .bind(old_contribution_id)
+    .bind(organization_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(map_correction_database_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO public.fuentes_geograficas_contribuciones_canonicas (
+            id, organizacion_id, establecimiento_id, fuente_geografica_id, confirmado_por
+        ) VALUES ($1, $2, $3, $4, $5)
+        "#,
+    )
+    .bind(new_contribution_id)
+    .bind(organization_id)
+    .bind(command.target_establishment_id)
+    .bind(active_source_id)
+    .bind(actor_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(map_correction_database_error)?;
+
+    let mut geometry_version_ids = Vec::with_capacity(affected.len());
+    for establishment_id in &affected {
+        geometry_version_ids.push(
+            persist_canonical_geometry_version(
+                transaction,
+                organization_id,
+                *establishment_id,
+                actor_id,
+            )
+            .await
+            .map_err(map_correction_database_error)?,
+        );
+    }
+    audit::record(
+        transaction,
+        &NewAuditEvent {
+            organization_id,
+            actor: AuditActor::Usuario(actor_id),
+            action: "fuente_geografica.corregida_reasignada",
+            entity_type: "fuente_geografica",
+            entity_id: Some(active_source_id),
+            reference: Some(command.correction_reason.as_str()),
+            before_state: Some(json!({
+                "fuente_geografica_id": command.source_id,
+                "establecimiento_id": previous_establishment_id,
+                "contribucion_id": old_contribution_id,
+            })),
+            after_state: Some(json!({
+                "fuente_geografica_id": active_source_id,
+                "reemplaza_fuente_geografica_id": (active_source_id != command.source_id).then_some(command.source_id),
+                "establecimiento_id": command.target_establishment_id,
+                "contribucion_id": new_contribution_id,
+                "version_geometria_ids": geometry_version_ids,
+            })),
+        },
+    )
+    .await
+    .map_err(|_| TerritoryCorrectionStoreError::Unavailable)?;
+    let replay_result = SafeIdempotencyResult::new(json!({
+        "fuente_anterior_id": command.source_id,
+        "fuente_activa_id": active_source_id,
+        "establecimiento_anterior_id": previous_establishment_id,
+        "establecimiento_destino_id": command.target_establishment_id,
+        "revision_creada": active_source_id != command.source_id,
+        "version_geometria_ids": geometry_version_ids,
+    }))
+    .expect("geographic correction replay result is bounded");
+    idempotency::complete(transaction, pending, replay_result)
+        .await
+        .map_err(map_correction_idempotency_error)?;
+    Ok(GeographicSourceCorrectionResult {
+        previous_source_id: command.source_id,
+        active_source_id,
+        previous_establishment_id,
+        target_establishment_id: command.target_establishment_id,
+        created_revision: active_source_id != command.source_id,
+        geometry_version_ids,
+        applied: true,
+    })
+}
+
+fn parse_replay_uuid(value: &Value, field: &str) -> Result<Uuid, TerritoryCorrectionStoreError> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .ok_or(TerritoryCorrectionStoreError::Unavailable)
+}
+
+fn map_correction_idempotency_error(error: IdempotencyError) -> TerritoryCorrectionStoreError {
+    match error {
+        IdempotencyError::Conflict(_) => TerritoryCorrectionStoreError::Conflict {
+            code: "idempotency_key_en_conflicto".to_owned(),
+            message: "La clave de idempotencia ya pertenece a otra corrección.".to_owned(),
+            affected_base_plot_ids: Vec::new(),
+        },
+        IdempotencyError::InvariantViolation | IdempotencyError::Database(_) => {
+            TerritoryCorrectionStoreError::Unavailable
+        }
+    }
+}
+
+fn map_correction_database_error(error: sqlx::Error) -> TerritoryCorrectionStoreError {
+    match &error {
+        sqlx::Error::Database(database_error)
+            if matches!(
+                database_error.code().as_deref(),
+                Some("23505" | "23503" | "P0001")
+            ) =>
+        {
+            TerritoryCorrectionStoreError::Conflict {
+                code: "correccion_geografica_en_conflicto".to_owned(),
+                message: "La corrección entra en conflicto con el estado territorial actual."
+                    .to_owned(),
+                affected_base_plot_ids: Vec::new(),
+            }
+        }
+        _ => TerritoryCorrectionStoreError::Unavailable,
     }
 }
 
@@ -368,6 +887,7 @@ async fn set_canonical_source_contributors_in_transaction(
         SELECT fuente_geografica_id
         FROM public.fuentes_geograficas_contribuciones_canonicas
         WHERE organizacion_id = $1 AND establecimiento_id = $2
+          AND vigente_hasta IS NULL
         ORDER BY fuente_geografica_id
         "#,
     )
@@ -387,69 +907,50 @@ async fn set_canonical_source_contributors_in_transaction(
     .await?;
 
     if changed {
+        let replacement_contribution_ids = source_ids
+            .iter()
+            .map(|_| Uuid::new_v4())
+            .collect::<Vec<_>>();
         sqlx::query(
             r#"
-            DELETE FROM public.fuentes_geograficas_contribuciones_canonicas
+            UPDATE public.fuentes_geograficas_contribuciones_canonicas
+            SET vigente_hasta = statement_timestamp(),
+                cerrada_por = $3
             WHERE organizacion_id = $1 AND establecimiento_id = $2
+              AND vigente_hasta IS NULL
             "#,
         )
         .bind(organization_id)
         .bind(grouping.establecimiento_id)
+        .bind(actor_id)
         .execute(&mut **transaction)
         .await
         .map_err(map_grouping_database_error)?;
         sqlx::query(
             r#"
             INSERT INTO public.fuentes_geograficas_contribuciones_canonicas (
-                organizacion_id, establecimiento_id, fuente_geografica_id, confirmado_por
+                id, organizacion_id, establecimiento_id, fuente_geografica_id, confirmado_por
             )
-            SELECT $1, $2, fuente_id, $4
-            FROM unnest($3::uuid[]) AS fuente_id
+            SELECT contribucion_id, $1, $2, fuente_id, $5
+            FROM unnest($3::uuid[], $4::uuid[]) AS nueva(fuente_id, contribucion_id)
             "#,
         )
         .bind(organization_id)
         .bind(grouping.establecimiento_id)
         .bind(source_ids)
+        .bind(&replacement_contribution_ids)
         .bind(actor_id)
         .execute(&mut **transaction)
         .await
         .map_err(map_grouping_database_error)?;
-
-        let updated = sqlx::query(
-            r#"
-            UPDATE public.establecimientos
-            SET geometria = (
-                    SELECT ST_Multi(ST_UnaryUnion(ST_Collect(fuente.geometria)))
-                    FROM public.fuentes_geograficas AS fuente
-                    WHERE fuente.organizacion_id = $1
-                      AND fuente.establecimiento_id = $2
-                      AND fuente.id = ANY($3::uuid[])
-                ),
-                origen_geometria = CASE
-                    WHEN NOT EXISTS (
-                        SELECT 1 FROM public.fuentes_geograficas AS fuente
-                        WHERE fuente.organizacion_id = $1 AND fuente.establecimiento_id = $2
-                          AND fuente.id = ANY($3::uuid[]) AND fuente.tipo_origen <> 'senasa_renspa'
-                    ) THEN 'senasa_renspa'
-                    WHEN NOT EXISTS (
-                        SELECT 1 FROM public.fuentes_geograficas AS fuente
-                        WHERE fuente.organizacion_id = $1 AND fuente.establecimiento_id = $2
-                          AND fuente.id = ANY($3::uuid[]) AND fuente.tipo_origen <> 'importada'
-                    ) THEN 'importada'
-                    ELSE 'manual'
-                END
-            WHERE id = $2 AND organizacion_id = $1
-            "#,
+        persist_canonical_geometry_version(
+            transaction,
+            organization_id,
+            grouping.establecimiento_id,
+            actor_id,
         )
-        .bind(organization_id)
-        .bind(grouping.establecimiento_id)
-        .bind(source_ids)
-        .execute(&mut **transaction)
         .await
-        .map_err(map_grouping_database_error)?;
-        if updated.rows_affected() != 1 {
-            return Err(TerritorySourceGroupingStoreError::NotFound);
-        }
+        .map_err(|_| TerritorySourceGroupingStoreError::Conflict)?;
 
         audit::record(
             transaction,
@@ -600,6 +1101,88 @@ async fn canonical_grouping_diagnostics(
     })
 }
 
+async fn persist_canonical_geometry_version(
+    transaction: &mut Transaction<'_, Postgres>,
+    organization_id: Uuid,
+    establishment_id: Uuid,
+    actor_id: Uuid,
+) -> Result<Uuid, sqlx::Error> {
+    let (Json(geometry), provenance, source_ids, previous_version_id): (
+        Json<Value>,
+        String,
+        Vec<Uuid>,
+        Option<Uuid>,
+    ) = sqlx::query_as(
+        r#"
+        WITH fuentes_activas AS MATERIALIZED (
+            SELECT fuente.id, fuente.geometria, fuente.tipo_origen
+            FROM public.fuentes_geograficas_contribuciones_canonicas AS contribucion
+            JOIN public.fuentes_geograficas AS fuente
+              ON fuente.id = contribucion.fuente_geografica_id
+             AND fuente.organizacion_id = contribucion.organizacion_id
+            WHERE contribucion.organizacion_id = $1
+              AND contribucion.establecimiento_id = $2
+              AND contribucion.vigente_hasta IS NULL
+        )
+        SELECT ST_AsGeoJSON(ST_Multi(ST_UnaryUnion(ST_Collect(geometria))), 9, 0)::jsonb,
+               CASE
+                   WHEN bool_and(tipo_origen = 'senasa_renspa') THEN 'senasa_renspa'
+                   WHEN bool_and(tipo_origen = 'importada') THEN 'importada'
+                   ELSE 'manual'
+               END,
+               array_agg(id ORDER BY id),
+               (SELECT geometria_version_actual_id FROM public.establecimientos
+                WHERE id = $2 AND organizacion_id = $1)
+        FROM fuentes_activas
+        "#,
+    )
+    .bind(organization_id)
+    .bind(establishment_id)
+    .fetch_one(&mut **transaction)
+    .await?;
+    let version_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO public.establecimientos_geometrias_versiones (
+            id, organizacion_id, establecimiento_id, version_anterior_id,
+            geometria, origen_geometria, fuente_geografica_ids, creado_por
+        ) VALUES (
+            $1, $2, $3, $4,
+            ST_Multi(ST_SetSRID(ST_GeomFromGeoJSON($5::jsonb), $6)), $7, $8, $9
+        )
+        "#,
+    )
+    .bind(version_id)
+    .bind(organization_id)
+    .bind(establishment_id)
+    .bind(previous_version_id)
+    .bind(Json(geometry))
+    .bind(TERRITORIAL_SRID)
+    .bind(provenance.as_str())
+    .bind(&source_ids)
+    .bind(actor_id)
+    .execute(&mut **transaction)
+    .await?;
+    sqlx::query(
+        r#"
+        UPDATE public.establecimientos AS establecimiento
+        SET geometria = version.geometria,
+            origen_geometria = version.origen_geometria,
+            geometria_version_actual_id = version.id
+        FROM public.establecimientos_geometrias_versiones AS version
+        WHERE establecimiento.id = $1
+          AND establecimiento.organizacion_id = $2
+          AND version.id = $3
+        "#,
+    )
+    .bind(establishment_id)
+    .bind(organization_id)
+    .bind(version_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(version_id)
+}
+
 fn replay_source_ids(value: &Value) -> Result<Vec<Uuid>, TerritorySourceGroupingStoreError> {
     value
         .get("fuente_geografica_ids")
@@ -631,22 +1214,26 @@ fn map_grouping_database_error(error: sqlx::Error) -> TerritorySourceGroupingSto
     }
 }
 
-type GeographicSourceRow = (
-    Uuid,
-    Uuid,
-    Option<Uuid>,
-    Option<String>,
-    String,
-    Option<String>,
-    String,
-    Json<Value>,
-    Vec<u8>,
-    String,
-    Uuid,
-    OffsetDateTime,
-    Option<Uuid>,
-    Option<OffsetDateTime>,
-);
+#[derive(sqlx::FromRow)]
+struct GeographicSourceRow {
+    id: Uuid,
+    establecimiento_id: Uuid,
+    external_reference_id: Option<Uuid>,
+    external_id: Option<String>,
+    tipo_origen: String,
+    nombre_externo: Option<String>,
+    texto_fuente_original: String,
+    geometria_geojson: Json<Value>,
+    huella_sha256: Vec<u8>,
+    version_parser: String,
+    creado_por: Uuid,
+    creado_en: OffsetDateTime,
+    reemplaza_fuente_geografica_id: Option<Uuid>,
+    motivo_correccion: Option<String>,
+    establecimiento_actual_id: Option<Uuid>,
+    confirmado_por: Option<Uuid>,
+    confirmado_en: Option<OffsetDateTime>,
+}
 
 async fn validate_normalized_geometry<'e, E>(
     executor: E,
@@ -783,8 +1370,10 @@ async fn confirm_senasa_source_in_transaction(
         ON CONFLICT (organizacion_id, huella_sha256) DO NOTHING
         RETURNING id, establecimiento_id, external_reference_id,
                   $12::text AS external_id, tipo_origen, nombre_externo,
-                  texto_fuente_original, ST_AsGeoJSON(geometria, 9, 0)::jsonb,
+                  texto_fuente_original, ST_AsGeoJSON(geometria, 9, 0)::jsonb AS geometria_geojson,
                   huella_sha256, version_parser, creado_por, creado_en,
+                  reemplaza_fuente_geografica_id, motivo_correccion,
+                  NULL::uuid AS establecimiento_actual_id,
                   NULL::uuid AS confirmado_por, NULL::timestamptz AS confirmado_en
         "#,
     )
@@ -926,11 +1515,14 @@ async fn create_alternative_establecimiento_in_transaction(
     let row: GeographicSourceRow = sqlx::query_as(r#"
         INSERT INTO public.fuentes_geograficas (organizacion_id, establecimiento_id, external_reference_id, tipo_origen, nombre_externo, texto_fuente_original, geometria, huella_sha256, version_parser, creado_por)
         VALUES ($1, $2, NULL, $3, NULL, $4, ST_Multi(ST_SetSRID(ST_GeomFromGeoJSON($5::jsonb), $6)), $7, $8, $9)
-        RETURNING id, establecimiento_id, external_reference_id, NULL::text AS external_id, tipo_origen, nombre_externo, texto_fuente_original, ST_AsGeoJSON(geometria, 9, 0)::jsonb, huella_sha256, version_parser, creado_por, creado_en, NULL::uuid, NULL::timestamptz
+        RETURNING id, establecimiento_id, external_reference_id, NULL::text AS external_id, tipo_origen, nombre_externo, texto_fuente_original, ST_AsGeoJSON(geometria, 9, 0)::jsonb AS geometria_geojson, huella_sha256, version_parser, creado_por, creado_en, reemplaza_fuente_geografica_id, motivo_correccion, NULL::uuid AS establecimiento_actual_id, NULL::uuid AS confirmado_por, NULL::timestamptz AS confirmado_en
     "#).bind(organization_id).bind(id).bind(request.source_type.as_str()).bind(original_geojson).bind(Json(request.geometry.as_geojson())).bind(TERRITORIAL_SRID).bind(request.fingerprint.as_bytes().as_slice()).bind(GEOJSON_INPUT_VERSION).bind(actor_id).fetch_one(&mut **transaction).await.map_err(map_source_database_error)?;
     let source = geographic_source_from_row(row)?;
     sqlx::query("INSERT INTO public.fuentes_geograficas_contribuciones_canonicas (organizacion_id, establecimiento_id, fuente_geografica_id, confirmado_por) VALUES ($1, $2, $3, $4)")
         .bind(organization_id).bind(id).bind(source.id).bind(actor_id).execute(&mut **transaction).await.map_err(map_source_database_error)?;
+    persist_canonical_geometry_version(transaction, organization_id, id, actor_id)
+        .await
+        .map_err(map_source_database_error)?;
     audit::record(transaction, &NewAuditEvent { organization_id, actor: AuditActor::Usuario(actor_id), action: "establecimiento.creado", entity_type: "establecimiento", entity_id: Some(id), reference: Some(request.codigo.as_str()), before_state: None, after_state: Some(json!({"establecimiento_id": id, "codigo": request.codigo.as_str(), "nombre": request.nombre.as_str(), "origen_geometria": request.source_type.as_str(), "activo": true})) }).await.map_err(|_| TerritorySourceStoreError::Unavailable)?;
     audit::record(transaction, &NewAuditEvent { organization_id, actor: AuditActor::Usuario(actor_id), action: "fuente_geografica.alternativa_confirmada", entity_type: "fuente_geografica", entity_id: Some(source.id), reference: Some(request.codigo.as_str()), before_state: None, after_state: Some(json!({"fuente_geografica_id": source.id, "establecimiento_id": id, "tipo_origen": request.source_type.as_str(), "huella_sha256": source.fingerprint.to_hex(), "version_parser": source.parser_version})) }).await.map_err(|_| TerritorySourceStoreError::Unavailable)?;
     idempotency::complete(transaction, pending, SafeIdempotencyResult::new(json!({"establecimiento_id": id.to_string(), "fuente_geografica_id": source.id.to_string()})).expect("result is small")).await.map_err(map_idempotency_error)?;
@@ -1049,13 +1641,16 @@ async fn load_geographic_source_by_id(
         r#"
         SELECT fuente.id, fuente.establecimiento_id, fuente.external_reference_id,
                referencia.external_id, fuente.tipo_origen, fuente.nombre_externo,
-               fuente.texto_fuente_original, ST_AsGeoJSON(fuente.geometria, 9, 0)::jsonb,
+               fuente.texto_fuente_original, ST_AsGeoJSON(fuente.geometria, 9, 0)::jsonb AS geometria_geojson,
                fuente.huella_sha256, fuente.version_parser, fuente.creado_por, fuente.creado_en,
+               fuente.reemplaza_fuente_geografica_id, fuente.motivo_correccion,
+               contribucion.establecimiento_id AS establecimiento_actual_id,
                contribucion.confirmado_por, contribucion.confirmado_en
         FROM public.fuentes_geograficas AS fuente
         LEFT JOIN public.external_references AS referencia ON referencia.id = fuente.external_reference_id
         LEFT JOIN public.fuentes_geograficas_contribuciones_canonicas AS contribucion
           ON contribucion.fuente_geografica_id = fuente.id
+         AND contribucion.vigente_hasta IS NULL
         WHERE fuente.organizacion_id = $1 AND fuente.id = $2
         "#,
     )
@@ -1077,13 +1672,16 @@ async fn load_geographic_source_by_fingerprint(
         r#"
         SELECT fuente.id, fuente.establecimiento_id, fuente.external_reference_id,
                referencia.external_id, fuente.tipo_origen, fuente.nombre_externo,
-               fuente.texto_fuente_original, ST_AsGeoJSON(fuente.geometria, 9, 0)::jsonb,
+               fuente.texto_fuente_original, ST_AsGeoJSON(fuente.geometria, 9, 0)::jsonb AS geometria_geojson,
                fuente.huella_sha256, fuente.version_parser, fuente.creado_por, fuente.creado_en,
+               fuente.reemplaza_fuente_geografica_id, fuente.motivo_correccion,
+               contribucion.establecimiento_id AS establecimiento_actual_id,
                contribucion.confirmado_por, contribucion.confirmado_en
         FROM public.fuentes_geograficas AS fuente
         LEFT JOIN public.external_references AS referencia ON referencia.id = fuente.external_reference_id
         LEFT JOIN public.fuentes_geograficas_contribuciones_canonicas AS contribucion
           ON contribucion.fuente_geografica_id = fuente.id
+         AND contribucion.vigente_hasta IS NULL
         WHERE fuente.organizacion_id = $1 AND fuente.huella_sha256 = $2
         "#,
     )
@@ -1097,67 +1695,62 @@ async fn load_geographic_source_by_fingerprint(
 }
 
 fn geographic_source_from_row(
-    (
-        id,
-        establecimiento_id,
-        external_reference_id,
-        external_id,
-        source_type,
-        external_name,
-        original_source_text,
-        Json(geometry),
-        fingerprint,
-        parser_version,
-        created_by,
-        created_at,
-        confirmed_by,
-        confirmed_at,
-    ): GeographicSourceRow,
+    row: GeographicSourceRow,
 ) -> Result<GeographicSourceView, TerritorySourceStoreError> {
-    let fingerprint: [u8; 32] = fingerprint
+    let fingerprint: [u8; 32] = row
+        .huella_sha256
         .try_into()
         .map_err(|_| TerritorySourceStoreError::Unavailable)?;
-    let source_type = match source_type.as_str() {
+    let source_type = match row.tipo_origen.as_str() {
         "senasa_renspa"
-            if parser_version == SENASA_PARSER_VERSION
-                && external_reference_id.is_some()
-                && external_id.is_some() =>
+            if matches!(
+                row.version_parser.as_str(),
+                SENASA_PARSER_VERSION | CORRECTION_PARSER_VERSION
+            ) && row.external_reference_id.is_some()
+                && row.external_id.is_some() =>
         {
             GeographicSourceType::SenasaRenspa
         }
         "manual"
-            if parser_version == GEOJSON_INPUT_VERSION
-                && external_reference_id.is_none()
-                && external_id.is_none() =>
+            if matches!(
+                row.version_parser.as_str(),
+                GEOJSON_INPUT_VERSION | CORRECTION_PARSER_VERSION
+            ) && row.external_reference_id.is_none()
+                && row.external_id.is_none() =>
         {
             GeographicSourceType::Manual
         }
         "importada"
-            if parser_version == GEOJSON_INPUT_VERSION
-                && external_reference_id.is_none()
-                && external_id.is_none() =>
+            if matches!(
+                row.version_parser.as_str(),
+                GEOJSON_INPUT_VERSION | CORRECTION_PARSER_VERSION
+            ) && row.external_reference_id.is_none()
+                && row.external_id.is_none() =>
         {
             GeographicSourceType::Importada
         }
         _ => return Err(TerritorySourceStoreError::Unavailable),
     };
     Ok(GeographicSourceView {
-        id,
-        establecimiento_id,
-        external_reference_id,
-        external_id,
+        id: row.id,
+        establecimiento_id: row.establecimiento_id,
+        external_reference_id: row.external_reference_id,
+        external_id: row.external_id,
         source_type,
-        external_name,
-        original_source_text,
-        geometry: multipolygon_from_geojson(geometry)
+        external_name: row.nombre_externo,
+        original_source_text: row.texto_fuente_original,
+        geometry: multipolygon_from_geojson(row.geometria_geojson.0)
             .map_err(|_| TerritorySourceStoreError::Unavailable)?,
         fingerprint: GeographicSourceFingerprint::from_bytes(fingerprint),
-        parser_version,
-        created_by,
-        created_at,
-        confirmed_for_canonical_geometry: confirmed_by.is_some(),
-        confirmed_by,
-        confirmed_at,
+        parser_version: row.version_parser,
+        created_by: row.creado_por,
+        created_at: row.creado_en,
+        replaces_source_id: row.reemplaza_fuente_geografica_id,
+        correction_reason: row.motivo_correccion,
+        current_establishment_id: row.establecimiento_actual_id,
+        confirmed_for_canonical_geometry: row.confirmado_por.is_some(),
+        confirmed_by: row.confirmado_por,
+        confirmed_at: row.confirmado_en,
     })
 }
 
@@ -1278,24 +1871,36 @@ impl TerritoryReadStore for PostgresTerritoryStore {
             return Err(TerritoryReadStoreError::NotFound);
         }
 
-        let rows: Vec<(Uuid, Uuid, Uuid, String, String, bool, Json<Value>)> = sqlx::query_as(
-            r#"
-            SELECT id, campana_id, establecimiento_id, codigo, nombre, activa,
+        let rows: Vec<(Uuid, Uuid, Uuid, Uuid, String, String, bool, Json<Value>)> =
+            sqlx::query_as(
+                r#"
+            SELECT id, campana_id, establecimiento_id, establecimiento_geometria_version_id,
+                   codigo, nombre, activa,
                    ST_AsGeoJSON(geometria, 9, 0)::jsonb
             FROM public.unidades_operativas
             WHERE organizacion_id = $1 AND campana_id = $2 AND establecimiento_id = $3
             ORDER BY codigo, id
             "#,
-        )
-        .bind(organization_id)
-        .bind(campana_id)
-        .bind(establecimiento_id)
-        .fetch_all(&self.db)
-        .await
-        .map_err(map_read_database_error)?;
+            )
+            .bind(organization_id)
+            .bind(campana_id)
+            .bind(establecimiento_id)
+            .fetch_all(&self.db)
+            .await
+            .map_err(map_read_database_error)?;
 
         let mut units = Vec::with_capacity(rows.len());
-        for (id, campana_id, establecimiento_id, codigo, nombre, activa, Json(geometria)) in rows {
+        for (
+            id,
+            campana_id,
+            establecimiento_id,
+            establishment_geometry_version_id,
+            codigo,
+            nombre,
+            activa,
+            Json(geometria),
+        ) in rows
+        {
             let lote_base_ids: Vec<Uuid> = sqlx::query_scalar(
                 r#"
                 SELECT vinculo.lote_base_id
@@ -1313,6 +1918,7 @@ impl TerritoryReadStore for PostgresTerritoryStore {
                 id,
                 campana_id,
                 establecimiento_id,
+                establishment_geometry_version_id,
                 codigo,
                 nombre,
                 activa,
@@ -1377,9 +1983,10 @@ impl PostgresTerritoryStore {
         organization_id: Uuid,
         establecimiento_id: Uuid,
     ) -> Result<EstablishmentView, TerritoryReadStoreError> {
-        let row: Option<(Uuid, String, String, bool, Json<Value>)> = sqlx::query_as(
+        let row: Option<(Uuid, Uuid, String, String, bool, Json<Value>)> = sqlx::query_as(
             r#"
-            SELECT id, codigo, nombre, activo, ST_AsGeoJSON(geometria, 9, 0)::jsonb
+            SELECT id, geometria_version_actual_id, codigo, nombre, activo,
+                   ST_AsGeoJSON(geometria, 9, 0)::jsonb
             FROM public.establecimientos
             WHERE id = $1 AND organizacion_id = $2
             "#,
@@ -1389,7 +1996,7 @@ impl PostgresTerritoryStore {
         .fetch_optional(&self.db)
         .await
         .map_err(map_read_database_error)?;
-        let (id, codigo, nombre, activo, Json(geometria)) =
+        let (id, geometry_version_id, codigo, nombre, activo, Json(geometria)) =
             row.ok_or(TerritoryReadStoreError::NotFound)?;
 
         let base_rows: Vec<(Uuid, String, String, bool, Json<Value>)> = sqlx::query_as(
@@ -1434,6 +2041,7 @@ impl PostgresTerritoryStore {
 
         Ok(EstablishmentView {
             id,
+            geometry_version_id,
             codigo,
             nombre,
             activo,

@@ -20,6 +20,7 @@ use crate::{
             self, BasePlotView, CampaignView, CanonicalSourceGrouping,
             CreatedAlternativeEstablecimiento, CreatedGeoJsonLoteBase, EstablishmentView,
             ExternalReferenceView, GeoJsonGeometryPreview, GeoJsonMultiPolygon,
+            GeographicSourceCorrectionPreview, GeographicSourceCorrectionResult,
             GeographicSourceView, OperationalUnitView, SenasaPolygonPreview,
             TerritorialUseAssignmentView, TerritoryApplicationError, TerritoryValidationError,
         },
@@ -55,6 +56,8 @@ pub struct BasePlotResponse {
 pub struct EstablishmentResponse {
     #[schema(value_type = String)]
     id: Uuid,
+    #[schema(value_type = String)]
+    geometria_version_id: Uuid,
     codigo: String,
     nombre: String,
     activo: bool,
@@ -84,6 +87,8 @@ pub struct OperationalUnitResponse {
     campana_id: Uuid,
     #[schema(value_type = String)]
     establecimiento_id: Uuid,
+    #[schema(value_type = String)]
+    establecimiento_geometria_version_id: Uuid,
     codigo: String,
     nombre: String,
     activa: bool,
@@ -206,10 +211,64 @@ pub struct GeographicSourceResponse {
     #[schema(value_type = String)]
     creado_por: Uuid,
     creado_en: String,
+    #[schema(value_type = Option<String>)]
+    reemplaza_fuente_geografica_id: Option<Uuid>,
+    motivo_correccion: Option<String>,
+    #[schema(value_type = Option<String>)]
+    establecimiento_actual_id: Option<Uuid>,
     confirmada_para_geometria_canonica: bool,
     #[schema(value_type = Option<String>)]
     confirmada_por: Option<Uuid>,
     confirmada_en: Option<String>,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct GeographicSourceCorrectionRequest {
+    #[schema(value_type = String)]
+    establecimiento_destino_id: Uuid,
+    geometry: Option<serde_json::Value>,
+    motivo: String,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct CanonicalGeometryImpactResponse {
+    #[schema(value_type = String)]
+    establecimiento_id: Uuid,
+    #[schema(value_type = Vec<String>)]
+    fuente_geografica_ids: Vec<Uuid>,
+    geometria_canonica: Option<GeoJsonMultiPolygonResponse>,
+    area_canonica_m2: Option<f64>,
+    #[schema(value_type = Vec<String>)]
+    lote_base_ids_excluidos: Vec<Uuid>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct GeographicSourceCorrectionPreviewResponse {
+    #[schema(value_type = String)]
+    fuente_geografica_id: Uuid,
+    #[schema(value_type = String)]
+    establecimiento_actual_id: Uuid,
+    #[schema(value_type = String)]
+    establecimiento_destino_id: Uuid,
+    crea_revision: bool,
+    impactos: Vec<CanonicalGeometryImpactResponse>,
+    conflictos: Vec<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct GeographicSourceCorrectionResponse {
+    #[schema(value_type = String)]
+    fuente_anterior_id: Uuid,
+    #[schema(value_type = String)]
+    fuente_activa_id: Uuid,
+    #[schema(value_type = String)]
+    establecimiento_anterior_id: Uuid,
+    #[schema(value_type = String)]
+    establecimiento_destino_id: Uuid,
+    revision_creada: bool,
+    #[schema(value_type = Vec<String>)]
+    version_geometria_ids: Vec<Uuid>,
+    aplicada: bool,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -277,6 +336,11 @@ impl IntoResponse for TerritoryRequestError {
             Self::Application(TerritoryApplicationError::Conflict) => {
                 StatusCode::CONFLICT.into_response()
             }
+            Self::Application(TerritoryApplicationError::ActionableConflict(error)) => (
+                StatusCode::CONFLICT,
+                Json(TerritorialValidationErrorResponse::from(error)),
+            )
+                .into_response(),
         }
     }
 }
@@ -316,6 +380,87 @@ pub fn routes() -> Router<AppState> {
             "/territorio/establecimientos/{establecimiento_id}/fuentes-geograficas-confirmadas",
             post(set_canonical_source_contributors),
         )
+        .route(
+            "/territorio/fuentes-geograficas/{fuente_geografica_id}/correcciones/previsualizacion",
+            post(preview_geographic_source_correction),
+        )
+        .route(
+            "/territorio/fuentes-geograficas/{fuente_geografica_id}/correcciones",
+            post(confirm_geographic_source_correction),
+        )
+}
+
+#[utoipa::path(
+    post,
+    path = "/territorio/fuentes-geograficas/{fuente_geografica_id}/correcciones/previsualizacion",
+    params(("fuente_geografica_id" = String, Path)),
+    request_body = GeographicSourceCorrectionRequest,
+    security(("supabaseBearer" = [])),
+    responses(
+        (status = 200, body = GeographicSourceCorrectionPreviewResponse),
+        (status = 400, body = TerritorialValidationErrorResponse),
+        (status = 401), (status = 403), (status = 404), (status = 503)
+    )
+)]
+pub(crate) async fn preview_geographic_source_correction(
+    State(state): State<AppState>,
+    Path(source_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(request): Json<GeographicSourceCorrectionRequest>,
+) -> Result<Json<GeographicSourceCorrectionPreviewResponse>, TerritoryRequestError> {
+    let context = crate::resolve_request_context(&state, &headers).await?;
+    let store = PostgresTerritoryStore::new(state.db.clone());
+    application::preview_geographic_source_correction(
+        &store,
+        &context,
+        source_id,
+        request.establecimiento_destino_id,
+        request.geometry,
+    )
+    .await
+    .map(GeographicSourceCorrectionPreviewResponse::from)
+    .map(Json)
+    .map_err(Into::into)
+}
+
+#[utoipa::path(
+    post,
+    path = "/territorio/fuentes-geograficas/{fuente_geografica_id}/correcciones",
+    params(("fuente_geografica_id" = String, Path)),
+    request_body = GeographicSourceCorrectionRequest,
+    security(("supabaseBearer" = [])),
+    responses(
+        (status = 200, body = GeographicSourceCorrectionResponse),
+        (status = 400, body = TerritorialValidationErrorResponse),
+        (status = 401), (status = 403), (status = 404),
+        (status = 409, body = TerritorialValidationErrorResponse), (status = 503)
+    )
+)]
+pub(crate) async fn confirm_geographic_source_correction(
+    State(state): State<AppState>,
+    Path(source_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(request): Json<GeographicSourceCorrectionRequest>,
+) -> Result<Json<GeographicSourceCorrectionResponse>, TerritoryRequestError> {
+    let context = crate::resolve_request_context(&state, &headers).await?;
+    let idempotency_key = required_idempotency_key(
+        &headers,
+        "Se requiere el encabezado Idempotency-Key para confirmar la corrección.",
+    )?;
+    let store = PostgresTerritoryStore::new(state.db.clone());
+    application::confirm_geographic_source_correction(
+        &store,
+        &context,
+        source_id,
+        request.establecimiento_destino_id,
+        request.geometry,
+        request.motivo,
+        idempotency_key,
+    )
+    .await
+    .map(GeographicSourceCorrectionResponse::from)
+    .map(Json)
+    .map_err(Into::into)
 }
 
 #[utoipa::path(
@@ -780,9 +925,49 @@ impl From<GeographicSourceView> for GeographicSourceResponse {
             version_parser: value.parser_version,
             creado_por: value.created_by,
             creado_en: value.created_at.to_string(),
+            reemplaza_fuente_geografica_id: value.replaces_source_id,
+            motivo_correccion: value.correction_reason,
+            establecimiento_actual_id: value.current_establishment_id,
             confirmada_para_geometria_canonica: value.confirmed_for_canonical_geometry,
             confirmada_por: value.confirmed_by,
             confirmada_en: value.confirmed_at.map(|timestamp| timestamp.to_string()),
+        }
+    }
+}
+
+impl From<GeographicSourceCorrectionPreview> for GeographicSourceCorrectionPreviewResponse {
+    fn from(value: GeographicSourceCorrectionPreview) -> Self {
+        Self {
+            fuente_geografica_id: value.source_id,
+            establecimiento_actual_id: value.current_establishment_id,
+            establecimiento_destino_id: value.target_establishment_id,
+            crea_revision: value.creates_revision,
+            impactos: value
+                .impacts
+                .into_iter()
+                .map(|impact| CanonicalGeometryImpactResponse {
+                    establecimiento_id: impact.establecimiento_id,
+                    fuente_geografica_ids: impact.source_ids,
+                    geometria_canonica: impact.geometry.map(Into::into),
+                    area_canonica_m2: impact.canonical_area_m2,
+                    lote_base_ids_excluidos: impact.excluded_base_plot_ids,
+                })
+                .collect(),
+            conflictos: value.conflicts,
+        }
+    }
+}
+
+impl From<GeographicSourceCorrectionResult> for GeographicSourceCorrectionResponse {
+    fn from(value: GeographicSourceCorrectionResult) -> Self {
+        Self {
+            fuente_anterior_id: value.previous_source_id,
+            fuente_activa_id: value.active_source_id,
+            establecimiento_anterior_id: value.previous_establishment_id,
+            establecimiento_destino_id: value.target_establishment_id,
+            revision_creada: value.created_revision,
+            version_geometria_ids: value.geometry_version_ids,
+            aplicada: value.applied,
         }
     }
 }
@@ -897,6 +1082,7 @@ impl From<EstablishmentView> for EstablishmentResponse {
     fn from(value: EstablishmentView) -> Self {
         Self {
             id: value.id,
+            geometria_version_id: value.geometry_version_id,
             codigo: value.codigo,
             nombre: value.nombre,
             activo: value.activo,
@@ -930,6 +1116,7 @@ impl From<OperationalUnitView> for OperationalUnitResponse {
             id: value.id,
             campana_id: value.campana_id,
             establecimiento_id: value.establecimiento_id,
+            establecimiento_geometria_version_id: value.establishment_geometry_version_id,
             codigo: value.codigo,
             nombre: value.nombre,
             activa: value.activa,
