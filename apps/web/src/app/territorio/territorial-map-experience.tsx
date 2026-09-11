@@ -9,6 +9,7 @@ import {
   type TerritorialEntityReference,
 } from "./territorial-map-presentation";
 import { TerritorialFichaPanel } from "./territorial-ficha";
+import { TerritoryGeometryCapture } from "./territory-geometry-capture";
 import styles from "./territorio.module.css";
 
 interface TerritorialMapExperienceProps {
@@ -20,6 +21,8 @@ export function TerritorialMapExperience({ data }: TerritorialMapExperienceProps
     data.campanas.length === 1 ? data.campanas[0].id : null,
   );
   const [selectedEntity, setSelectedEntity] = useState<TerritorialEntityReference | null>(null);
+  const [drawnGeometry, setDrawnGeometry] = useState<unknown>(null);
+  const [drawingEnabled, setDrawingEnabled] = useState(false);
 
   const layers = useMemo(
     () => createTerritorialMapLayers(data, selectedCampaignId),
@@ -29,18 +32,6 @@ export function TerritorialMapExperience({ data }: TerritorialMapExperienceProps
     () => territorialFicha(data, selectedEntity),
     [data, selectedEntity],
   );
-
-  if (data.establecimientos.length === 0) {
-    return (
-      <main className={styles.statePage}>
-        <section className={styles.notice}>
-          <p className={styles.eyebrow}>Territorio</p>
-          <h1>No hay información territorial</h1>
-          <p>No hay establecimientos visibles con geometría territorial para esta organización.</p>
-        </section>
-      </main>
-    );
-  }
 
   const selectedCampaign = data.campanas.find((campaign) => campaign.id === selectedCampaignId);
   const isCampaignChoiceRequired = data.campanas.length > 1 && !selectedCampaignId;
@@ -93,8 +84,11 @@ export function TerritorialMapExperience({ data }: TerritorialMapExperienceProps
             layers={layers}
             selectedEntity={selectedEntity}
             onSelectEntity={setSelectedEntity}
+            drawingEnabled={drawingEnabled}
+            onDrawGeometry={setDrawnGeometry}
           />
         </div>
+        <TerritoryGeometryCapture establecimientos={data.establecimientos} drawnGeometry={drawnGeometry} onDrawingModeChange={setDrawingEnabled} />
         <TerritorialFichaPanel ficha={ficha} />
       </section>
     </main>

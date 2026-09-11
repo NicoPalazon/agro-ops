@@ -42,12 +42,13 @@ describe("TerritorialMapExperience", () => {
     expect(markup).not.toContain('option value="c1" selected=""');
   });
 
-  it("shows a clear empty state when no establishments are visible", () => {
+  it("offers first-establishment capture when no establishments are visible", () => {
     const markup = renderToStaticMarkup(
       <TerritorialMapExperience data={{ ...data(0), establecimientos: [] }} />,
     );
 
-    expect(markup).toContain("No hay información territorial");
-    expect(markup).not.toContain("Mapa operativo");
+    expect(markup).toContain("Mapa operativo");
+    expect(markup).toContain("Nuevo establecimiento");
+    expect(markup).toContain("No hay campañas disponibles");
   });
 });

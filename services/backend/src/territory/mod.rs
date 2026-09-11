@@ -9,6 +9,7 @@ pub mod api;
 pub mod application;
 pub mod domain;
 pub mod geographic_source;
+pub mod geojson;
 pub mod infrastructure;
 pub mod senasa;
 pub mod source_grouping;

@@ -18,9 +18,11 @@ use crate::{
     territory::{
         application::{
             BasePlotView, CampaignView, CanonicalSourceGrouping, ConfirmedGeographicSource,
-            EstablishmentView, ExternalReferenceView, GeoJsonMultiPolygon, GeographicSourceView,
-            NewCanonicalSourceGrouping, NewSenasaGeographicSource, OperationalUnitView,
-            TerritorialUseAssignmentView, TerritoryPreviewStore, TerritoryPreviewStoreError,
+            CreatedAlternativeEstablecimiento, CreatedGeoJsonLoteBase, EstablishmentView,
+            ExternalReferenceView, GeoJsonMultiPolygon, GeographicSourceView,
+            NewAlternativeEstablecimiento, NewCanonicalSourceGrouping, NewGeoJsonLoteBase,
+            NewSenasaGeographicSource, OperationalUnitView, TerritorialUseAssignmentView,
+            TerritoryGeoJsonStore, TerritoryPreviewStore, TerritoryPreviewStoreError,
             TerritoryReadStore, TerritoryReadStoreError, TerritorySourceGroupingStore,
             TerritorySourceGroupingStoreError, TerritorySourceStore, TerritorySourceStoreError,
             TerritoryStore, TerritoryStoreError,
@@ -32,7 +34,7 @@ use crate::{
         geographic_source::{
             GeographicSourceFingerprint, GeographicSourceType, SENASA_PARSER_VERSION,
         },
-        senasa::NormalizedPolygon4326,
+        geojson::{GEOJSON_INPUT_VERSION, NormalizedGeoJsonMultiPolygon},
     },
 };
 
@@ -113,11 +115,76 @@ impl TerritoryStore for PostgresTerritoryStore {
 
 #[async_trait]
 impl TerritoryPreviewStore for PostgresTerritoryStore {
-    async fn preview_normalized_polygon(
+    async fn preview_normalized_geometry(
         &self,
-        polygon: &NormalizedPolygon4326,
+        geometry: &NormalizedGeoJsonMultiPolygon,
     ) -> Result<GeoJsonMultiPolygon, TerritoryPreviewStoreError> {
-        validate_normalized_polygon(&self.db, polygon).await
+        validate_normalized_geometry(&self.db, geometry).await
+    }
+}
+
+#[async_trait]
+impl TerritoryGeoJsonStore for PostgresTerritoryStore {
+    async fn create_alternative_establecimiento(
+        &self,
+        organization_id: Uuid,
+        actor_id: Uuid,
+        request: NewAlternativeEstablecimiento,
+    ) -> Result<CreatedAlternativeEstablecimiento, TerritorySourceStoreError> {
+        let mut transaction = self
+            .db
+            .begin()
+            .await
+            .map_err(|_| TerritorySourceStoreError::Unavailable)?;
+        let result = create_alternative_establecimiento_in_transaction(
+            &mut transaction,
+            organization_id,
+            actor_id,
+            request,
+        )
+        .await;
+        match result {
+            Ok(value) => transaction
+                .commit()
+                .await
+                .map(|()| value)
+                .map_err(|_| TerritorySourceStoreError::Unavailable),
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn create_geojson_lote_base(
+        &self,
+        organization_id: Uuid,
+        actor_id: Uuid,
+        request: NewGeoJsonLoteBase,
+    ) -> Result<CreatedGeoJsonLoteBase, TerritorySourceStoreError> {
+        let mut transaction = self
+            .db
+            .begin()
+            .await
+            .map_err(|_| TerritorySourceStoreError::Unavailable)?;
+        let result = create_geojson_lote_base_in_transaction(
+            &mut transaction,
+            organization_id,
+            actor_id,
+            request,
+        )
+        .await;
+        match result {
+            Ok(value) => transaction
+                .commit()
+                .await
+                .map(|()| value)
+                .map_err(|_| TerritorySourceStoreError::Unavailable),
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
     }
 }
 
@@ -178,7 +245,7 @@ impl TerritorySourceStore for PostgresTerritoryStore {
                    fuente.huella_sha256, fuente.version_parser, fuente.creado_por, fuente.creado_en,
                    contribucion.confirmado_por, contribucion.confirmado_en
             FROM public.fuentes_geograficas AS fuente
-            JOIN public.external_references AS referencia ON referencia.id = fuente.external_reference_id
+            LEFT JOIN public.external_references AS referencia ON referencia.id = fuente.external_reference_id
             LEFT JOIN public.fuentes_geograficas_contribuciones_canonicas AS contribucion
               ON contribucion.fuente_geografica_id = fuente.id
             WHERE fuente.organizacion_id = $1 AND fuente.establecimiento_id = $2
@@ -358,7 +425,19 @@ async fn set_canonical_source_contributors_in_transaction(
                       AND fuente.establecimiento_id = $2
                       AND fuente.id = ANY($3::uuid[])
                 ),
-                origen_geometria = 'senasa_renspa'
+                origen_geometria = CASE
+                    WHEN NOT EXISTS (
+                        SELECT 1 FROM public.fuentes_geograficas AS fuente
+                        WHERE fuente.organizacion_id = $1 AND fuente.establecimiento_id = $2
+                          AND fuente.id = ANY($3::uuid[]) AND fuente.tipo_origen <> 'senasa_renspa'
+                    ) THEN 'senasa_renspa'
+                    WHEN NOT EXISTS (
+                        SELECT 1 FROM public.fuentes_geograficas AS fuente
+                        WHERE fuente.organizacion_id = $1 AND fuente.establecimiento_id = $2
+                          AND fuente.id = ANY($3::uuid[]) AND fuente.tipo_origen <> 'importada'
+                    ) THEN 'importada'
+                    ELSE 'manual'
+                END
             WHERE id = $2 AND organizacion_id = $1
             "#,
         )
@@ -555,8 +634,8 @@ fn map_grouping_database_error(error: sqlx::Error) -> TerritorySourceGroupingSto
 type GeographicSourceRow = (
     Uuid,
     Uuid,
-    Uuid,
-    String,
+    Option<Uuid>,
+    Option<String>,
     String,
     Option<String>,
     String,
@@ -569,9 +648,9 @@ type GeographicSourceRow = (
     Option<OffsetDateTime>,
 );
 
-async fn validate_normalized_polygon<'e, E>(
+async fn validate_normalized_geometry<'e, E>(
     executor: E,
-    polygon: &NormalizedPolygon4326,
+    geometry: &NormalizedGeoJsonMultiPolygon,
 ) -> Result<GeoJsonMultiPolygon, TerritoryPreviewStoreError>
 where
     E: Executor<'e, Database = Postgres>,
@@ -589,7 +668,7 @@ where
         FROM normalized
         "#,
     )
-    .bind(Json(polygon.as_geojson_polygon()))
+    .bind(Json(geometry.as_geojson()))
     .bind(TERRITORIAL_SRID)
     .fetch_one(executor)
     .await
@@ -663,7 +742,11 @@ async fn confirm_senasa_source_in_transaction(
 
     // This is the same 3.6a PostGIS validation path, now run in the mutation
     // transaction before source evidence can be inserted.
-    validate_normalized_polygon(&mut **transaction, &source.normalized_polygon)
+    let normalized = crate::territory::geojson::normalize_geometry(
+        source.normalized_polygon.as_geojson_polygon(),
+    )
+    .expect("parsed SENASA geometry is valid GeoJSON structure");
+    validate_normalized_geometry(&mut **transaction, &normalized)
         .await
         .map_err(TerritorySourceStoreError::Validation)?;
 
@@ -732,7 +815,7 @@ async fn confirm_senasa_source_in_transaction(
                     action: "fuente_geografica.senasa_confirmada",
                     entity_type: "fuente_geografica",
                     entity_id: Some(source.id),
-                    reference: Some(source.external_id.as_str()),
+                    reference: source.external_id.as_deref(),
                     before_state: None,
                     after_state: Some(json!({
                         "fuente_geografica_id": source.id,
@@ -766,6 +849,197 @@ async fn confirm_senasa_source_in_transaction(
     Ok(ConfirmedGeographicSource { source, created })
 }
 
+async fn create_alternative_establecimiento_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    organization_id: Uuid,
+    actor_id: Uuid,
+    request: NewAlternativeEstablecimiento,
+) -> Result<CreatedAlternativeEstablecimiento, TerritorySourceStoreError> {
+    let operation = OperationCode::new("territorio.crear_establecimiento_geojson")
+        .expect("operation code is canonical");
+    let decision = idempotency::begin(
+        transaction,
+        IdempotencyRequest {
+            organization_id: Some(organization_id),
+            operation,
+            key: request.idempotency_key.clone(),
+            request_fingerprint: request.idempotency_request_fingerprint,
+        },
+    )
+    .await
+    .map_err(map_idempotency_error)?;
+    if let IdempotencyDecision::Replay(replay) = decision {
+        let source_id = replay
+            .result
+            .as_value()
+            .get("fuente_geografica_id")
+            .and_then(Value::as_str)
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .ok_or(TerritorySourceStoreError::Unavailable)?;
+        let source = load_geographic_source_by_id(transaction, organization_id, source_id).await?;
+        let establecimiento = load_establecimiento_in_transaction(
+            transaction,
+            organization_id,
+            source.establecimiento_id,
+        )
+        .await?;
+        return Ok(CreatedAlternativeEstablecimiento {
+            establecimiento,
+            source,
+            created: false,
+        });
+    }
+    let IdempotencyDecision::Proceed(pending) = decision else {
+        unreachable!()
+    };
+    validate_normalized_geometry(&mut **transaction, &request.geometry)
+        .await
+        .map_err(TerritorySourceStoreError::Validation)?;
+    let id = Uuid::new_v4();
+    let establishment_row: (Uuid, Uuid, String, String, String, String, bool, Uuid, OffsetDateTime) = sqlx::query_as(r#"
+        INSERT INTO public.establecimientos (id, organizacion_id, codigo, nombre, geometria, origen_geometria, creado_por)
+        VALUES ($1, $2, $3, $4, ST_Multi(ST_SetSRID(ST_GeomFromGeoJSON($5::jsonb), $6)), $7, $8)
+        RETURNING id, organizacion_id, codigo, nombre, ST_AsEWKT(geometria), origen_geometria, activo, creado_por, creado_en
+    "#).bind(id).bind(organization_id).bind(request.codigo.as_str()).bind(request.nombre.as_str()).bind(Json(request.geometry.as_geojson())).bind(TERRITORIAL_SRID).bind(request.source_type.as_str()).bind(actor_id).fetch_one(&mut **transaction).await.map_err(map_source_database_error)?;
+    let establecimiento = establecimiento_from_row(establishment_row)
+        .map_err(|_| TerritorySourceStoreError::Unavailable)?;
+    if let Some(renspa) = request.renspa.clone() {
+        external_references::register(
+            transaction,
+            NewExternalReference {
+                organization_id: Some(organization_id),
+                system: ExternalSystem::new(RENSPA_SYSTEM).expect("system is canonical"),
+                external_id: renspa,
+                entity_type: ExternalEntityType::new(ESTABLECIMIENTO_ENTITY_TYPE)
+                    .expect("entity is canonical"),
+                entity_id: id,
+                sync_version: None,
+                last_sync_status: LastSyncStatus::Pendiente,
+                last_synced_at: None,
+            },
+        )
+        .await
+        .map_err(map_external_reference_source_error)?;
+    }
+    let original_geojson = serde_json::to_string(&request.original_geojson)
+        .map_err(|_| TerritorySourceStoreError::Unavailable)?;
+    let row: GeographicSourceRow = sqlx::query_as(r#"
+        INSERT INTO public.fuentes_geograficas (organizacion_id, establecimiento_id, external_reference_id, tipo_origen, nombre_externo, texto_fuente_original, geometria, huella_sha256, version_parser, creado_por)
+        VALUES ($1, $2, NULL, $3, NULL, $4, ST_Multi(ST_SetSRID(ST_GeomFromGeoJSON($5::jsonb), $6)), $7, $8, $9)
+        RETURNING id, establecimiento_id, external_reference_id, NULL::text AS external_id, tipo_origen, nombre_externo, texto_fuente_original, ST_AsGeoJSON(geometria, 9, 0)::jsonb, huella_sha256, version_parser, creado_por, creado_en, NULL::uuid, NULL::timestamptz
+    "#).bind(organization_id).bind(id).bind(request.source_type.as_str()).bind(original_geojson).bind(Json(request.geometry.as_geojson())).bind(TERRITORIAL_SRID).bind(request.fingerprint.as_bytes().as_slice()).bind(GEOJSON_INPUT_VERSION).bind(actor_id).fetch_one(&mut **transaction).await.map_err(map_source_database_error)?;
+    let source = geographic_source_from_row(row)?;
+    sqlx::query("INSERT INTO public.fuentes_geograficas_contribuciones_canonicas (organizacion_id, establecimiento_id, fuente_geografica_id, confirmado_por) VALUES ($1, $2, $3, $4)")
+        .bind(organization_id).bind(id).bind(source.id).bind(actor_id).execute(&mut **transaction).await.map_err(map_source_database_error)?;
+    audit::record(transaction, &NewAuditEvent { organization_id, actor: AuditActor::Usuario(actor_id), action: "establecimiento.creado", entity_type: "establecimiento", entity_id: Some(id), reference: Some(request.codigo.as_str()), before_state: None, after_state: Some(json!({"establecimiento_id": id, "codigo": request.codigo.as_str(), "nombre": request.nombre.as_str(), "origen_geometria": request.source_type.as_str(), "activo": true})) }).await.map_err(|_| TerritorySourceStoreError::Unavailable)?;
+    audit::record(transaction, &NewAuditEvent { organization_id, actor: AuditActor::Usuario(actor_id), action: "fuente_geografica.alternativa_confirmada", entity_type: "fuente_geografica", entity_id: Some(source.id), reference: Some(request.codigo.as_str()), before_state: None, after_state: Some(json!({"fuente_geografica_id": source.id, "establecimiento_id": id, "tipo_origen": request.source_type.as_str(), "huella_sha256": source.fingerprint.to_hex(), "version_parser": source.parser_version})) }).await.map_err(|_| TerritorySourceStoreError::Unavailable)?;
+    idempotency::complete(transaction, pending, SafeIdempotencyResult::new(json!({"establecimiento_id": id.to_string(), "fuente_geografica_id": source.id.to_string()})).expect("result is small")).await.map_err(map_idempotency_error)?;
+    Ok(CreatedAlternativeEstablecimiento {
+        establecimiento,
+        source,
+        created: true,
+    })
+}
+
+async fn create_geojson_lote_base_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    organization_id: Uuid,
+    actor_id: Uuid,
+    request: NewGeoJsonLoteBase,
+) -> Result<CreatedGeoJsonLoteBase, TerritorySourceStoreError> {
+    let operation = OperationCode::new("territorio.crear_lote_base_geojson")
+        .expect("operation code is canonical");
+    let decision = idempotency::begin(
+        transaction,
+        IdempotencyRequest {
+            organization_id: Some(organization_id),
+            operation,
+            key: request.idempotency_key.clone(),
+            request_fingerprint: request.idempotency_request_fingerprint,
+        },
+    )
+    .await
+    .map_err(map_idempotency_error)?;
+    if let IdempotencyDecision::Replay(replay) = decision {
+        let id = replay
+            .result
+            .as_value()
+            .get("lote_base_id")
+            .and_then(Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .ok_or(TerritorySourceStoreError::Unavailable)?;
+        return load_lote_base_in_transaction(transaction, organization_id, id)
+            .await
+            .map(|lote_base| CreatedGeoJsonLoteBase {
+                lote_base,
+                created: false,
+            });
+    }
+    let IdempotencyDecision::Proceed(pending) = decision else {
+        unreachable!()
+    };
+    let parent_exists: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM public.establecimientos WHERE id = $1 AND organizacion_id = $2",
+    )
+    .bind(request.establecimiento_id)
+    .bind(organization_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(|_| TerritorySourceStoreError::Unavailable)?;
+    if parent_exists.is_none() {
+        return Err(TerritorySourceStoreError::NotFound);
+    }
+    validate_normalized_geometry(&mut **transaction, &request.geometry)
+        .await
+        .map_err(TerritorySourceStoreError::Validation)?;
+    let id = Uuid::new_v4();
+    let row: (Uuid, Uuid, Uuid, String, String, String, bool, Uuid, OffsetDateTime) = sqlx::query_as(r#"
+        INSERT INTO public.lotes_base (id, organizacion_id, establecimiento_id, codigo, nombre, geometria, creado_por)
+        VALUES ($1, $2, $3, $4, $5, ST_Multi(ST_SetSRID(ST_GeomFromGeoJSON($6::jsonb), $7)), $8)
+        RETURNING id, organizacion_id, establecimiento_id, codigo, nombre, ST_AsEWKT(geometria), activo, creado_por, creado_en
+    "#).bind(id).bind(organization_id).bind(request.establecimiento_id).bind(request.codigo.as_str()).bind(request.nombre.as_str()).bind(Json(request.geometry.as_geojson())).bind(TERRITORIAL_SRID).bind(actor_id).fetch_one(&mut **transaction).await.map_err(map_source_database_error)?;
+    let lote_base = lote_base_from_row(row).map_err(|_| TerritorySourceStoreError::Unavailable)?;
+    audit::record(transaction, &NewAuditEvent { organization_id, actor: AuditActor::Usuario(actor_id), action: "lote_base.creado", entity_type: "lote_base", entity_id: Some(id), reference: Some(request.codigo.as_str()), before_state: None, after_state: Some(json!({"lote_base_id": id, "establecimiento_id": request.establecimiento_id, "codigo": request.codigo.as_str(), "nombre": request.nombre.as_str(), "srid": TERRITORIAL_SRID, "activo": true})) }).await.map_err(|_| TerritorySourceStoreError::Unavailable)?;
+    idempotency::complete(
+        transaction,
+        pending,
+        SafeIdempotencyResult::new(json!({"lote_base_id": id.to_string()}))
+            .expect("result is small"),
+    )
+    .await
+    .map_err(map_idempotency_error)?;
+    Ok(CreatedGeoJsonLoteBase {
+        lote_base,
+        created: true,
+    })
+}
+
+async fn load_establecimiento_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    organization_id: Uuid,
+    id: Uuid,
+) -> Result<Establecimiento, TerritorySourceStoreError> {
+    let row = sqlx::query_as("SELECT id, organizacion_id, codigo, nombre, ST_AsEWKT(geometria), origen_geometria, activo, creado_por, creado_en FROM public.establecimientos WHERE id = $1 AND organizacion_id = $2")
+        .bind(id).bind(organization_id).fetch_optional(&mut **transaction).await.map_err(|_| TerritorySourceStoreError::Unavailable)?;
+    row.map(establecimiento_from_row)
+        .transpose()
+        .map_err(|_| TerritorySourceStoreError::Unavailable)?
+        .ok_or(TerritorySourceStoreError::NotFound)
+}
+
+async fn load_lote_base_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    organization_id: Uuid,
+    id: Uuid,
+) -> Result<LoteBase, TerritorySourceStoreError> {
+    let row = sqlx::query_as("SELECT id, organizacion_id, establecimiento_id, codigo, nombre, ST_AsEWKT(geometria), activo, creado_por, creado_en FROM public.lotes_base WHERE id = $1 AND organizacion_id = $2")
+        .bind(id).bind(organization_id).fetch_optional(&mut **transaction).await.map_err(|_| TerritorySourceStoreError::Unavailable)?;
+    row.map(lote_base_from_row)
+        .transpose()
+        .map_err(|_| TerritorySourceStoreError::Unavailable)?
+        .ok_or(TerritorySourceStoreError::NotFound)
+}
+
 async fn load_geographic_source_by_id(
     transaction: &mut Transaction<'_, Postgres>,
     organization_id: Uuid,
@@ -779,7 +1053,7 @@ async fn load_geographic_source_by_id(
                fuente.huella_sha256, fuente.version_parser, fuente.creado_por, fuente.creado_en,
                contribucion.confirmado_por, contribucion.confirmado_en
         FROM public.fuentes_geograficas AS fuente
-        JOIN public.external_references AS referencia ON referencia.id = fuente.external_reference_id
+        LEFT JOIN public.external_references AS referencia ON referencia.id = fuente.external_reference_id
         LEFT JOIN public.fuentes_geograficas_contribuciones_canonicas AS contribucion
           ON contribucion.fuente_geografica_id = fuente.id
         WHERE fuente.organizacion_id = $1 AND fuente.id = $2
@@ -807,7 +1081,7 @@ async fn load_geographic_source_by_fingerprint(
                fuente.huella_sha256, fuente.version_parser, fuente.creado_por, fuente.creado_en,
                contribucion.confirmado_por, contribucion.confirmado_en
         FROM public.fuentes_geograficas AS fuente
-        JOIN public.external_references AS referencia ON referencia.id = fuente.external_reference_id
+        LEFT JOIN public.external_references AS referencia ON referencia.id = fuente.external_reference_id
         LEFT JOIN public.fuentes_geograficas_contribuciones_canonicas AS contribucion
           ON contribucion.fuente_geografica_id = fuente.id
         WHERE fuente.organizacion_id = $1 AND fuente.huella_sha256 = $2
@@ -843,17 +1117,36 @@ fn geographic_source_from_row(
     let fingerprint: [u8; 32] = fingerprint
         .try_into()
         .map_err(|_| TerritorySourceStoreError::Unavailable)?;
-    if source_type != GeographicSourceType::SenasaRenspa.as_str()
-        || parser_version != SENASA_PARSER_VERSION
-    {
-        return Err(TerritorySourceStoreError::Unavailable);
-    }
+    let source_type = match source_type.as_str() {
+        "senasa_renspa"
+            if parser_version == SENASA_PARSER_VERSION
+                && external_reference_id.is_some()
+                && external_id.is_some() =>
+        {
+            GeographicSourceType::SenasaRenspa
+        }
+        "manual"
+            if parser_version == GEOJSON_INPUT_VERSION
+                && external_reference_id.is_none()
+                && external_id.is_none() =>
+        {
+            GeographicSourceType::Manual
+        }
+        "importada"
+            if parser_version == GEOJSON_INPUT_VERSION
+                && external_reference_id.is_none()
+                && external_id.is_none() =>
+        {
+            GeographicSourceType::Importada
+        }
+        _ => return Err(TerritorySourceStoreError::Unavailable),
+    };
     Ok(GeographicSourceView {
         id,
         establecimiento_id,
         external_reference_id,
         external_id,
-        source_type: GeographicSourceType::SenasaRenspa,
+        source_type,
         external_name,
         original_source_text,
         geometry: multipolygon_from_geojson(geometry)
@@ -874,6 +1167,20 @@ fn map_idempotency_error(error: IdempotencyError) -> TerritorySourceStoreError {
         IdempotencyError::InvariantViolation | IdempotencyError::Database(_) => {
             TerritorySourceStoreError::Unavailable
         }
+    }
+}
+
+fn map_source_database_error(error: sqlx::Error) -> TerritorySourceStoreError {
+    match &error {
+        sqlx::Error::Database(database_error)
+            if matches!(
+                database_error.code().as_deref(),
+                Some("23505" | "23503" | "P0001")
+            ) =>
+        {
+            TerritorySourceStoreError::Conflict
+        }
+        _ => TerritorySourceStoreError::Unavailable,
     }
 }
 

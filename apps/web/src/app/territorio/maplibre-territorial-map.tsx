@@ -10,6 +10,8 @@ interface MapLibreTerritorialMapProps {
   layers: TerritorialMapLayers;
   selectedEntity: TerritorialEntityReference | null;
   onSelectEntity: (entity: TerritorialEntityReference | null) => void;
+  drawingEnabled?: boolean;
+  onDrawGeometry?: (geometry: { type: "Polygon"; coordinates: number[][][] }) => void;
 }
 
 const sourceIds = {
@@ -88,17 +90,28 @@ export function MapLibreTerritorialMap({
   layers,
   selectedEntity,
   onSelectEntity,
+  drawingEnabled = false,
+  onDrawGeometry,
 }: MapLibreTerritorialMapProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
   const layersInstalledRef = useRef(false);
   const onSelectRef = useRef(onSelectEntity);
+  const drawingRef = useRef<number[][]>([]);
+  const drawingEnabledRef = useRef(drawingEnabled);
+  const onDrawRef = useRef(onDrawGeometry);
   const [ready, setReady] = useState(false);
   const [initializationError, setInitializationError] = useState(false);
 
   useEffect(() => {
     onSelectRef.current = onSelectEntity;
   }, [onSelectEntity]);
+
+  useEffect(() => {
+    drawingEnabledRef.current = drawingEnabled;
+    onDrawRef.current = onDrawGeometry;
+    if (!drawingEnabled) drawingRef.current = [];
+  }, [drawingEnabled, onDrawGeometry]);
 
   useEffect(() => {
     let cancelled = false;
@@ -129,6 +142,14 @@ export function MapLibreTerritorialMap({
           if (!cancelled) setReady(true);
         });
         map.on("click", (event) => {
+          if (drawingEnabledRef.current) {
+            drawingRef.current = [...drawingRef.current, [event.lngLat.lng, event.lngLat.lat]];
+            if (drawingRef.current.length >= 3) {
+              const ring = [...drawingRef.current, drawingRef.current[0]];
+              onDrawRef.current?.({ type: "Polygon", coordinates: [ring] });
+            }
+            return;
+          }
           if (!layersInstalledRef.current) return;
           const features = map?.queryRenderedFeatures(event.point, {
             layers: clickableLayerIds,

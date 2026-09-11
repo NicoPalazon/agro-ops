@@ -7,21 +7,33 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::{external_references::ExternalId, territory::senasa::NormalizedPolygon4326};
+use crate::{
+    external_references::ExternalId,
+    territory::{
+        geojson::{GEOJSON_INPUT_VERSION, NormalizedGeoJsonMultiPolygon},
+        senasa::NormalizedPolygon4326,
+    },
+};
 
 pub const SENASA_RENSPA_SOURCE_TYPE: &str = "senasa_renspa";
 pub const SENASA_PARSER_VERSION: &str = "senasa_pasted_polygon_v1";
+pub const MANUAL_SOURCE_TYPE: &str = "manual";
+pub const IMPORTED_SOURCE_TYPE: &str = "importada";
 const MAX_EXTERNAL_NAME_LENGTH: usize = 255;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GeographicSourceType {
     SenasaRenspa,
+    Manual,
+    Importada,
 }
 
 impl GeographicSourceType {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SenasaRenspa => SENASA_RENSPA_SOURCE_TYPE,
+            Self::Manual => MANUAL_SOURCE_TYPE,
+            Self::Importada => IMPORTED_SOURCE_TYPE,
         }
     }
 }
@@ -80,6 +92,22 @@ impl GeographicSourceFingerprint {
             "tipo_origen": SENASA_RENSPA_SOURCE_TYPE,
             "version_parser": SENASA_PARSER_VERSION,
             "anillo_normalizado": polygon.ring(),
+        });
+        let bytes = serde_json::to_vec(&canonical)
+            .expect("canonical geographic-source fingerprint serialization must succeed");
+        Self(Sha256::digest(bytes).into())
+    }
+
+    pub fn for_alternative(
+        establishment_code: &str,
+        source_type: GeographicSourceType,
+        geometry: &NormalizedGeoJsonMultiPolygon,
+    ) -> Self {
+        let canonical = json!({
+            "establecimiento_codigo": establishment_code,
+            "tipo_origen": source_type.as_str(),
+            "version_parser": GEOJSON_INPUT_VERSION,
+            "geometria_normalizada": geometry.as_geojson(),
         });
         let bytes = serde_json::to_vec(&canonical)
             .expect("canonical geographic-source fingerprint serialization must succeed");

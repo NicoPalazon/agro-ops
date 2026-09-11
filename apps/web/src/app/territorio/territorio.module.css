@@ -74,7 +74,7 @@
 
 .workspace {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(280px, 350px);
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 330px) minmax(280px, 350px);
   width: min(100%, 1440px);
   margin: 0 auto;
   border: 1px solid var(--territory-border);
@@ -163,6 +163,29 @@
   padding: 24px;
   background: var(--territory-surface);
 }
+
+.capturePanel {
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  min-width: 280px;
+  padding: 20px;
+  border-right: 1px solid var(--territory-border);
+  background: white;
+}
+
+.capturePanel h2 { font-size: 20px; line-height: 1.15; }
+.capturePanel label { display: grid; gap: 5px; color: var(--territory-muted); font-size: 12px; font-weight: 650; }
+.capturePanel input, .capturePanel select, .capturePanel textarea { width: 100%; border: 1px solid var(--territory-border); border-radius: 6px; padding: 8px; color: var(--territory-ink); background: white; font: inherit; font-size: 13px; font-weight: 400; }
+.capturePanel textarea { resize: vertical; font-family: ui-monospace, monospace; }
+.captureChoices { display: flex; flex-wrap: wrap; gap: 7px; }
+.captureChoices button, .primaryButton { border: 1px solid var(--territory-border); border-radius: 6px; padding: 8px 10px; color: var(--territory-ink); background: white; font: inherit; font-size: 12px; font-weight: 650; cursor: pointer; }
+.captureChoices button:disabled, .primaryButton:disabled { cursor: not-allowed; opacity: .5; }
+.captureChoices .choiceActive, .primaryButton { border-color: #15533e; color: white; background: #15533e; }
+.captureHint, .validState, .validationState { font-size: 12px; line-height: 1.45; }
+.captureHint { color: var(--territory-muted); }
+.validState { color: #15533e; }
+.validationState { color: #8b2e25; }
 
 .ficha h2 {
   margin-top: 6px;
@@ -272,6 +295,8 @@
     border-right: 0;
     border-bottom: 1px solid var(--territory-border);
   }
+
+  .capturePanel { border-right: 0; border-bottom: 1px solid var(--territory-border); }
 
   .legend {
     justify-content: start;

@@ -17,11 +17,13 @@ use crate::{
     idempotency::IdempotencyKey,
     territory::{
         application::{
-            self, BasePlotView, CampaignView, CanonicalSourceGrouping, EstablishmentView,
-            ExternalReferenceView, GeoJsonMultiPolygon, GeographicSourceView, OperationalUnitView,
-            SenasaPolygonPreview, TerritorialUseAssignmentView, TerritoryApplicationError,
-            TerritoryValidationError,
+            self, BasePlotView, CampaignView, CanonicalSourceGrouping,
+            CreatedAlternativeEstablecimiento, CreatedGeoJsonLoteBase, EstablishmentView,
+            ExternalReferenceView, GeoJsonGeometryPreview, GeoJsonMultiPolygon,
+            GeographicSourceView, OperationalUnitView, SenasaPolygonPreview,
+            TerritorialUseAssignmentView, TerritoryApplicationError, TerritoryValidationError,
         },
+        geographic_source::GeographicSourceType,
         infrastructure::PostgresTerritoryStore,
     },
 };
@@ -119,6 +121,56 @@ pub struct SenasaPolygonPreviewResponse {
     valida: bool,
 }
 
+#[derive(Deserialize, ToSchema)]
+pub struct GeoJsonGeometryPreviewRequest {
+    geometry: serde_json::Value,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct GeoJsonGeometryPreviewResponse {
+    geometria: GeoJsonMultiPolygonResponse,
+    tipo_geometria: &'static str,
+    srid: i32,
+    valida: bool,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct CreateAlternativeEstablecimientoRequest {
+    codigo: String,
+    nombre: String,
+    tipo_origen: String,
+    geometry: serde_json::Value,
+    renspa: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct CreatedAlternativeEstablecimientoResponse {
+    #[schema(value_type = String)]
+    establecimiento_id: Uuid,
+    codigo: String,
+    nombre: String,
+    origen_geometria: &'static str,
+    fuente_geografica: GeographicSourceResponse,
+    creada: bool,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct CreateGeoJsonLoteBaseRequest {
+    codigo: String,
+    nombre: String,
+    geometry: serde_json::Value,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct CreatedGeoJsonLoteBaseResponse {
+    #[schema(value_type = String)]
+    lote_base_id: Uuid,
+    establecimiento_id: Uuid,
+    codigo: String,
+    nombre: String,
+    creado: bool,
+}
+
 #[derive(Serialize, ToSchema)]
 pub struct TerritorialValidationErrorResponse {
     codigo: &'static str,
@@ -143,8 +195,8 @@ pub struct GeographicSourceResponse {
     #[schema(value_type = String)]
     establecimiento_id: Uuid,
     #[schema(value_type = String)]
-    external_reference_id: Uuid,
-    external_id: String,
+    external_reference_id: Option<Uuid>,
+    external_id: Option<String>,
     tipo_origen: &'static str,
     nombre_externo: Option<String>,
     texto_fuente_original: String,
@@ -231,7 +283,7 @@ impl IntoResponse for TerritoryRequestError {
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/territorio/establecimientos", get(list_establecimientos))
+        .route("/territorio/establecimientos", get(list_establecimientos).post(create_alternative_establecimiento))
         .route(
             "/territorio/establecimientos/{establecimiento_id}",
             get(get_establecimiento),
@@ -250,6 +302,8 @@ pub fn routes() -> Router<AppState> {
             "/territorio/previsualizaciones/senasa-poligono",
             post(preview_senasa_polygon),
         )
+        .route("/territorio/previsualizaciones/geojson", post(preview_geojson_geometry))
+        .route("/territorio/establecimientos/{establecimiento_id}/lotes-base", post(create_geojson_lote_base))
         .route(
             "/territorio/establecimientos/{establecimiento_id}/fuentes-geograficas/senasa",
             post(confirm_senasa_geographic_source),
@@ -400,6 +454,91 @@ pub(crate) async fn preview_senasa_polygon(
         .map(SenasaPolygonPreviewResponse::from)
         .map(Json)
         .map_err(Into::into)
+}
+
+#[utoipa::path(post, path = "/territorio/previsualizaciones/geojson", request_body = GeoJsonGeometryPreviewRequest, security(("supabaseBearer" = [])), responses((status = 200, body = GeoJsonGeometryPreviewResponse), (status = 400, body = TerritorialValidationErrorResponse), (status = 401), (status = 403), (status = 503)))]
+pub(crate) async fn preview_geojson_geometry(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<GeoJsonGeometryPreviewRequest>,
+) -> Result<Json<GeoJsonGeometryPreviewResponse>, TerritoryRequestError> {
+    let context = crate::resolve_request_context(&state, &headers).await?;
+    let store = PostgresTerritoryStore::new(state.db.clone());
+    application::preview_geojson_geometry(&store, &context, request.geometry)
+        .await
+        .map(GeoJsonGeometryPreviewResponse::from)
+        .map(Json)
+        .map_err(Into::into)
+}
+
+#[utoipa::path(post, path = "/territorio/establecimientos", request_body = CreateAlternativeEstablecimientoRequest, security(("supabaseBearer" = [])), responses((status = 201, body = CreatedAlternativeEstablecimientoResponse), (status = 200, body = CreatedAlternativeEstablecimientoResponse), (status = 400, body = TerritorialValidationErrorResponse), (status = 401), (status = 403), (status = 409), (status = 503)))]
+pub(crate) async fn create_alternative_establecimiento(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateAlternativeEstablecimientoRequest>,
+) -> Result<(StatusCode, Json<CreatedAlternativeEstablecimientoResponse>), TerritoryRequestError> {
+    let context = crate::resolve_request_context(&state, &headers).await?;
+    let idempotency_key = geojson_idempotency_key(&headers)?;
+    let source_type = match request.tipo_origen.as_str() {
+        "manual" => GeographicSourceType::Manual,
+        "importada" => GeographicSourceType::Importada,
+        _ => {
+            return Err(TerritoryRequestError::Application(
+                TerritoryApplicationError::Validation(TerritoryValidationError {
+                    code: "tipo_origen_invalido",
+                    message: "El origen debe ser manual o importada.".to_owned(),
+                    detail: None,
+                    line: None,
+                }),
+            ));
+        }
+    };
+    let store = PostgresTerritoryStore::new(state.db.clone());
+    let created = application::create_alternative_establecimiento(
+        &store,
+        &context,
+        request.codigo,
+        request.nombre,
+        source_type,
+        request.geometry,
+        request.renspa,
+        idempotency_key,
+    )
+    .await?;
+    let status = if created.created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(created.into())))
+}
+
+#[utoipa::path(post, path = "/territorio/establecimientos/{establecimiento_id}/lotes-base", params(("establecimiento_id" = String, Path)), request_body = CreateGeoJsonLoteBaseRequest, security(("supabaseBearer" = [])), responses((status = 201, body = CreatedGeoJsonLoteBaseResponse), (status = 200, body = CreatedGeoJsonLoteBaseResponse), (status = 400, body = TerritorialValidationErrorResponse), (status = 401), (status = 403), (status = 404), (status = 409), (status = 503)))]
+pub(crate) async fn create_geojson_lote_base(
+    State(state): State<AppState>,
+    Path(establecimiento_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(request): Json<CreateGeoJsonLoteBaseRequest>,
+) -> Result<(StatusCode, Json<CreatedGeoJsonLoteBaseResponse>), TerritoryRequestError> {
+    let context = crate::resolve_request_context(&state, &headers).await?;
+    let idempotency_key = geojson_idempotency_key(&headers)?;
+    let store = PostgresTerritoryStore::new(state.db.clone());
+    let created = application::create_geojson_lote_base(
+        &store,
+        &context,
+        establecimiento_id,
+        request.codigo,
+        request.nombre,
+        request.geometry,
+        idempotency_key,
+    )
+    .await?;
+    let status = if created.created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(created.into())))
 }
 
 #[utoipa::path(
@@ -590,6 +729,42 @@ impl From<SenasaPolygonPreview> for SenasaPolygonPreviewResponse {
     }
 }
 
+impl From<GeoJsonGeometryPreview> for GeoJsonGeometryPreviewResponse {
+    fn from(value: GeoJsonGeometryPreview) -> Self {
+        Self {
+            geometria: value.geometry.into(),
+            tipo_geometria: "MultiPolygon",
+            srid: value.srid,
+            valida: true,
+        }
+    }
+}
+
+impl From<CreatedAlternativeEstablecimiento> for CreatedAlternativeEstablecimientoResponse {
+    fn from(value: CreatedAlternativeEstablecimiento) -> Self {
+        Self {
+            establecimiento_id: value.establecimiento.id,
+            codigo: value.establecimiento.codigo.as_str().to_owned(),
+            nombre: value.establecimiento.nombre.as_str().to_owned(),
+            origen_geometria: value.establecimiento.origen_geometria.as_str(),
+            fuente_geografica: value.source.into(),
+            creada: value.created,
+        }
+    }
+}
+
+impl From<CreatedGeoJsonLoteBase> for CreatedGeoJsonLoteBaseResponse {
+    fn from(value: CreatedGeoJsonLoteBase) -> Self {
+        Self {
+            lote_base_id: value.lote_base.id,
+            establecimiento_id: value.lote_base.establecimiento_id,
+            codigo: value.lote_base.codigo.as_str().to_owned(),
+            nombre: value.lote_base.nombre.as_str().to_owned(),
+            creado: value.created,
+        }
+    }
+}
+
 impl From<GeographicSourceView> for GeographicSourceResponse {
     fn from(value: GeographicSourceView) -> Self {
         Self {
@@ -651,6 +826,13 @@ fn source_idempotency_key(headers: &HeaderMap) -> Result<IdempotencyKey, Territo
     required_idempotency_key(
         headers,
         "Se requiere el encabezado Idempotency-Key para confirmar una fuente.",
+    )
+}
+
+fn geojson_idempotency_key(headers: &HeaderMap) -> Result<IdempotencyKey, TerritoryRequestError> {
+    required_idempotency_key(
+        headers,
+        "Se requiere el encabezado Idempotency-Key para confirmar la geometría.",
     )
 }
 

@@ -11,10 +11,14 @@ use crate::{
     external_references::ExternalId,
     idempotency::{IdempotencyKey, RequestFingerprint},
     territory::{
-        domain::{Establecimiento, LoteBase, NewEstablecimiento, NewLoteBase, TERRITORIAL_SRID},
+        domain::{
+            CanonicalTerritorialCode, Establecimiento, FunctionalName, LoteBase,
+            NewEstablecimiento, NewLoteBase, TERRITORIAL_SRID,
+        },
         geographic_source::{
             ExternalSourceName, GeographicSourceFingerprint, GeographicSourceType,
         },
+        geojson::{self, GeoJsonGeometryError, NormalizedGeoJsonMultiPolygon},
         senasa::{self, NormalizedPolygon4326, SenasaPolygonParseError},
         source_grouping::{ConfirmedSourceSet, InvalidConfirmedSourceSet},
     },
@@ -29,6 +33,12 @@ pub enum TerritoryStoreError {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SenasaPolygonPreview {
     pub source_coordinate_pair_count: usize,
+    pub geometry: GeoJsonMultiPolygon,
+    pub srid: i32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GeoJsonGeometryPreview {
     pub geometry: GeoJsonMultiPolygon,
     pub srid: i32,
 }
@@ -53,8 +63,8 @@ pub enum TerritoryPreviewStoreError {
 pub struct GeographicSourceView {
     pub id: Uuid,
     pub establecimiento_id: Uuid,
-    pub external_reference_id: Uuid,
-    pub external_id: String,
+    pub external_reference_id: Option<Uuid>,
+    pub external_id: Option<String>,
     pub source_type: GeographicSourceType,
     pub external_name: Option<String>,
     pub original_source_text: String,
@@ -84,6 +94,42 @@ pub struct NewSenasaGeographicSource {
     pub fingerprint: GeographicSourceFingerprint,
     pub idempotency_key: IdempotencyKey,
     pub idempotency_request_fingerprint: RequestFingerprint,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewAlternativeEstablecimiento {
+    pub codigo: CanonicalTerritorialCode,
+    pub nombre: FunctionalName,
+    pub source_type: GeographicSourceType,
+    pub original_geojson: serde_json::Value,
+    pub geometry: NormalizedGeoJsonMultiPolygon,
+    pub fingerprint: GeographicSourceFingerprint,
+    pub renspa: Option<ExternalId>,
+    pub idempotency_key: IdempotencyKey,
+    pub idempotency_request_fingerprint: RequestFingerprint,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewGeoJsonLoteBase {
+    pub establecimiento_id: Uuid,
+    pub codigo: CanonicalTerritorialCode,
+    pub nombre: FunctionalName,
+    pub geometry: NormalizedGeoJsonMultiPolygon,
+    pub idempotency_key: IdempotencyKey,
+    pub idempotency_request_fingerprint: RequestFingerprint,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreatedAlternativeEstablecimiento {
+    pub establecimiento: Establecimiento,
+    pub source: GeographicSourceView,
+    pub created: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreatedGeoJsonLoteBase {
+    pub lote_base: LoteBase,
+    pub created: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -248,10 +294,29 @@ pub trait TerritoryStore: Send + Sync {
 /// Read-only PostGIS validation boundary for normalized external geometry.
 #[async_trait]
 pub trait TerritoryPreviewStore: Send + Sync {
-    async fn preview_normalized_polygon(
+    async fn preview_normalized_geometry(
         &self,
-        polygon: &NormalizedPolygon4326,
+        geometry: &NormalizedGeoJsonMultiPolygon,
     ) -> Result<GeoJsonMultiPolygon, TerritoryPreviewStoreError>;
+}
+
+/// Separate write port for the GeoJSON capture slice. Existing WKT-backed
+/// territory creation remains isolated for older callers.
+#[async_trait]
+pub trait TerritoryGeoJsonStore: Send + Sync {
+    async fn create_alternative_establecimiento(
+        &self,
+        organization_id: Uuid,
+        actor_id: Uuid,
+        request: NewAlternativeEstablecimiento,
+    ) -> Result<CreatedAlternativeEstablecimiento, TerritorySourceStoreError>;
+
+    async fn create_geojson_lote_base(
+        &self,
+        organization_id: Uuid,
+        actor_id: Uuid,
+        request: NewGeoJsonLoteBase,
+    ) -> Result<CreatedGeoJsonLoteBase, TerritorySourceStoreError>;
 }
 
 /// Transactional source-evidence persistence and provenance read boundary.
@@ -301,8 +366,10 @@ pub async fn preview_senasa_polygon(
         .require_permission(TERRITORIO_CREAR)
         .map_err(|PermissionDenied| TerritoryApplicationError::PermissionDenied)?;
     let polygon = senasa::parse_polygon(source_text).map_err(parser_validation_error)?;
+    let normalized = geojson::normalize_geometry(polygon.as_geojson_polygon())
+        .expect("a parsed SENASA polygon is always valid GeoJSON structure");
     let geometry = store
-        .preview_normalized_polygon(&polygon)
+        .preview_normalized_geometry(&normalized)
         .await
         .map_err(map_preview_store_error)?;
 
@@ -311,6 +378,136 @@ pub async fn preview_senasa_polygon(
         geometry,
         srid: TERRITORIAL_SRID,
     })
+}
+
+pub async fn preview_geojson_geometry(
+    store: &dyn TerritoryPreviewStore,
+    context: &AuthorizationContext,
+    source_geometry: serde_json::Value,
+) -> Result<GeoJsonGeometryPreview, TerritoryApplicationError> {
+    context
+        .require_permission(TERRITORIO_CREAR)
+        .map_err(|PermissionDenied| TerritoryApplicationError::PermissionDenied)?;
+    let geometry =
+        geojson::normalize_geometry(source_geometry).map_err(geojson_validation_error)?;
+    let geometry = store
+        .preview_normalized_geometry(&geometry)
+        .await
+        .map_err(map_preview_store_error)?;
+    Ok(GeoJsonGeometryPreview {
+        geometry,
+        srid: TERRITORIAL_SRID,
+    })
+}
+
+pub async fn create_alternative_establecimiento(
+    store: &dyn TerritoryGeoJsonStore,
+    context: &AuthorizationContext,
+    codigo: String,
+    nombre: String,
+    source_type: GeographicSourceType,
+    source_geometry: serde_json::Value,
+    renspa: Option<String>,
+    idempotency_key: IdempotencyKey,
+) -> Result<CreatedAlternativeEstablecimiento, TerritoryApplicationError> {
+    context
+        .require_permission(TERRITORIO_CREAR)
+        .map_err(|PermissionDenied| TerritoryApplicationError::PermissionDenied)?;
+    if source_type == GeographicSourceType::SenasaRenspa {
+        return Err(TerritoryApplicationError::Validation(
+            TerritoryValidationError {
+                code: "tipo_origen_invalido",
+                message: "Para este flujo el origen debe ser manual o importada.".to_owned(),
+                detail: None,
+                line: None,
+            },
+        ));
+    }
+    let codigo = CanonicalTerritorialCode::new(codigo).map_err(|_| {
+        territorial_field_error(
+            "codigo_invalido",
+            "El código debe usar mayúsculas, números, guiones o guiones bajos.",
+        )
+    })?;
+    let nombre = FunctionalName::new(nombre).map_err(|_| {
+        territorial_field_error(
+            "nombre_invalido",
+            "El nombre debe ser válido y no tener espacios laterales.",
+        )
+    })?;
+    let geometry =
+        geojson::normalize_geometry(source_geometry.clone()).map_err(geojson_validation_error)?;
+    let renspa = renspa.map(ExternalId::new).transpose().map_err(|_| {
+        territorial_field_error(
+            "referencia_externa_invalida",
+            "La referencia RENSPA debe ser texto válido y sin espacios laterales.",
+        )
+    })?;
+    let fingerprint =
+        GeographicSourceFingerprint::for_alternative(codigo.as_str(), source_type, &geometry);
+    let canonical_request = serde_json::to_vec(&json!({"codigo": codigo.as_str(), "nombre": nombre.as_str(), "tipo_origen": source_type.as_str(), "geometria": geometry.as_geojson(), "renspa": renspa.as_ref().map(ExternalId::as_str)})).expect("canonical alternative establishment request must serialize");
+    store
+        .create_alternative_establecimiento(
+            context.organization_id,
+            context.user_id,
+            NewAlternativeEstablecimiento {
+                codigo,
+                nombre,
+                source_type,
+                original_geojson: source_geometry,
+                geometry,
+                fingerprint,
+                renspa,
+                idempotency_key,
+                idempotency_request_fingerprint: RequestFingerprint::sha256(&canonical_request),
+            },
+        )
+        .await
+        .map_err(map_source_store_error)
+}
+
+pub async fn create_geojson_lote_base(
+    store: &dyn TerritoryGeoJsonStore,
+    context: &AuthorizationContext,
+    establecimiento_id: Uuid,
+    codigo: String,
+    nombre: String,
+    source_geometry: serde_json::Value,
+    idempotency_key: IdempotencyKey,
+) -> Result<CreatedGeoJsonLoteBase, TerritoryApplicationError> {
+    context
+        .require_permission(TERRITORIO_CREAR)
+        .map_err(|PermissionDenied| TerritoryApplicationError::PermissionDenied)?;
+    let codigo = CanonicalTerritorialCode::new(codigo).map_err(|_| {
+        territorial_field_error(
+            "codigo_invalido",
+            "El código debe usar mayúsculas, números, guiones o guiones bajos.",
+        )
+    })?;
+    let nombre = FunctionalName::new(nombre).map_err(|_| {
+        territorial_field_error(
+            "nombre_invalido",
+            "El nombre debe ser válido y no tener espacios laterales.",
+        )
+    })?;
+    let geometry =
+        geojson::normalize_geometry(source_geometry).map_err(geojson_validation_error)?;
+    let canonical_request = serde_json::to_vec(&json!({"establecimiento_id": establecimiento_id, "codigo": codigo.as_str(), "nombre": nombre.as_str(), "geometria": geometry.as_geojson()})).expect("canonical lote request must serialize");
+    store
+        .create_geojson_lote_base(
+            context.organization_id,
+            context.user_id,
+            NewGeoJsonLoteBase {
+                establecimiento_id,
+                codigo,
+                nombre,
+                geometry,
+                idempotency_key,
+                idempotency_request_fingerprint: RequestFingerprint::sha256(&canonical_request),
+            },
+        )
+        .await
+        .map_err(map_source_store_error)
 }
 
 pub async fn confirm_senasa_source(
@@ -543,6 +740,24 @@ fn parser_validation_error(error: SenasaPolygonParseError) -> TerritoryApplicati
         message: error.kind.message().to_owned(),
         detail: None,
         line: error.line,
+    })
+}
+
+fn geojson_validation_error(error: GeoJsonGeometryError) -> TerritoryApplicationError {
+    TerritoryApplicationError::Validation(TerritoryValidationError {
+        code: error.kind.code(),
+        message: error.kind.message().to_owned(),
+        detail: None,
+        line: None,
+    })
+}
+
+fn territorial_field_error(code: &'static str, message: &'static str) -> TerritoryApplicationError {
+    TerritoryApplicationError::Validation(TerritoryValidationError {
+        code,
+        message: message.to_owned(),
+        detail: None,
+        line: None,
     })
 }
 
