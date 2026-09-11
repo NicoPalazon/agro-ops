@@ -362,7 +362,7 @@ async fn database_constraints_and_restrictive_organization_history_are_enforced(
     // Including the direct FK dependent table lets PostgreSQL reach the ExternalReference
     // trigger; the exact message excludes fuentes_geograficas' own truncate trigger.
     let truncate_references_with_geographic_sources =
-        sqlx::query("TRUNCATE TABLE external_references, fuentes_geograficas")
+        sqlx::query("TRUNCATE TABLE external_references, fuentes_geograficas, fuentes_geograficas_contribuciones_canonicas")
             .execute(&db)
             .await
             .expect_err("external identity history must not be truncated");
